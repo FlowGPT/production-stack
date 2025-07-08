@@ -99,6 +99,10 @@ def validate_args(args):
         raise ValueError(
             "Session key must be provided when using session routing logic."
         )
+    if args.routing_logic == "cache_aware_load_balancing" and args.session_key is None:
+        raise ValueError(
+            "Session key must be provided when using cache_aware_load_balancing routing logic."
+        )
     if args.log_stats and args.log_stats_interval <= 0:
         raise ValueError("Log stats interval must be greater than 0.")
     if args.engine_stats_interval <= 0:
@@ -180,12 +184,34 @@ def parse_args():
         choices=[
             "roundrobin",
             "session",
+            "cache_aware_load_balancing",
             "kvaware",
             "prefixaware",
             "disaggregated_prefill",
         ],
         help="The routing logic to use",
     )
+
+    parser.add_argument(
+        "--tolerate-waiting-requests",
+        type=int,
+        default=10,
+        help="The number of waiting requests to tolerate in cache-aware load balancing router.",
+    )
+
+    parser.add_argument(
+        "--enable-request-logging",
+        action="store_true",
+        help="Enable request logging, record the routing decision and performance data of each request",
+    )
+
+    parser.add_argument(
+        "--request-log-dir",
+        type=str,
+        default=None,
+        help="The directory to store the request log file, if provided, the log will be written to this file",
+    )
+
     parser.add_argument(
         "--lmcache-controller-port",
         type=int,

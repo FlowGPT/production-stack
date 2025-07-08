@@ -213,6 +213,161 @@ class SessionRouter(RoutingInterface):
         return url
 
 
+class CacheAwareLoadBalancingRouter(RoutingInterface):
+    """
+    Routing algorithm that combines load balancing with KV Cache hit rate awareness
+    
+    This algorithm considers three key factors:
+    1. Engine load (number of queuing requests, number of running requests)
+    2. Estimated KV cache hit rate (for specific sessions)
+    """
+    
+    def __init__(self, session_key: str = None, tolerate_waiting_requests: int = 20):
+        if hasattr(self, "_initialized"):
+            return
+            
+        if session_key is None:
+            raise ValueError("CacheAwareLoadBalancingRouter must be initialized with a session_key")
+            
+        self.session_key = session_key
+        self.tolerate_waiting_requests = tolerate_waiting_requests
+        
+        # Initialize hash ring
+        self.hash_ring = HashRing()
+
+        self.req_id = 0  # Request ID, used for round-robin selection
+        
+        self._initialized = True
+    
+    def _calculate_engine_load_score(self, engine_url: str, 
+                                    engine_stats: Dict[str, EngineStats], 
+                                    request_stats: Dict[str, RequestStats]) -> float:
+        """
+        Calculate engine load score
+        
+        Lower score indicates lighter engine load
+
+        Load factors: load score (running requests * 0.02 + queuing requests * 0.1)
+        """
+        if engine_url not in engine_stats:
+            return 0.0  # No statistics available, assume load is 0
+            
+        # Get engine statistics
+        stats = engine_stats[engine_url]
+        
+        # Basic load factors: running requests and queuing requests
+        running_load = stats.num_running_requests * 0.02  # Running requests weight
+        queuing_load = stats.num_queuing_requests * 0.1  # Queuing requests weight (slightly higher)
+        
+        # Calculate total load score
+        total_load_score = running_load + queuing_load
+        
+        return total_load_score
+    
+    def _update_hash_ring(self, endpoints: List["EndpointInfo"]):
+        """
+        Update the hash ring with the current list of endpoints.
+        """
+        # Extract endpoint URLs
+        endpoint_urls = [endpoint.url for endpoint in endpoints]
+
+        # Get the current nodes in the hash ring
+        current_nodes = set(self.hash_ring.get_nodes())
+
+        # Convert the new endpoint URLs to a set for easy comparison
+        new_nodes = set(endpoint_urls)
+
+        # Remove nodes that are no longer in the list
+        for node in current_nodes - new_nodes:
+            self.hash_ring.remove_node(node)
+
+        # Add new nodes that are not already in the hash ring
+        for node in new_nodes - current_nodes:
+            self.hash_ring.add_node(node)
+
+    def _select_best_engine(self, session_id: str, endpoints: List[EndpointInfo],
+                          engine_stats: Dict[str, EngineStats],
+                          request_stats: Dict[str, RequestStats]) -> Tuple[str, str]:
+        """
+        Select the best engine
+        1. First determine which engine the request corresponds to based on hash_ring
+        2. Check the queue situation of that engine (num_queuing_requests)
+        3. If there are queuing requests (>tolerate_waiting_requests), try to find an engine without queue
+        4. If all engines have queues, assign engine based on probability
+        5. If the initial engine has no queuing requests, use session-based routing (i.e., hash_ring result)
+        """
+        # Update hash ring to reflect currently available endpoints
+        self._update_hash_ring(endpoints)
+        
+        # Use hash_ring to get the initial engine_url
+        initial_engine_url = self.hash_ring.get_node(session_id)
+
+        routing_method = "cache_aware"
+        
+        # Check the queuing situation of the initial engine
+        if engine_stats[initial_engine_url].num_queuing_requests < self.tolerate_waiting_requests:
+            # If queuing requests are less than tolerate_waiting_requests, use it directly
+            logger.debug(f"Session {session_id} initial engine waitting requests < {self.tolerate_waiting_requests}, route to: {initial_engine_url}")
+            return initial_engine_url, routing_method
+        
+        # Try to find engines without queue
+        engines_without_queue = []
+        for info in endpoints:
+            url = info.url
+            if engine_stats[url].num_queuing_requests == 0:
+                engines_without_queue.append(url)
+        
+        # If there are engines without queue, randomly select one
+        if engines_without_queue:
+            routing_method = "redirect_to_no_queue_engine"
+            selected_engine = random.choice(engines_without_queue)
+            logger.debug(f"Session {session_id} redirect to no queue engine: {selected_engine}")
+            return selected_engine, routing_method
+        
+        # All engines have queues, select one based on probability
+        routing_method = "probability_based"
+        total_queue_length = sum(engine_stats[url].num_queuing_requests for url in [info.url for info in endpoints])
+        probabilities = [1 / (engine_stats[url].num_queuing_requests / total_queue_length) for url in [info.url for info in endpoints]]
+        probabilities = [p / sum(probabilities) for p in probabilities]
+        
+        selected_engine = random.choices([info.url for info in endpoints], weights=probabilities)[0]
+        
+        logger.debug(f"Session {session_id} probability based routing to: {selected_engine}")
+        return selected_engine, routing_method
+
+    def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+    ) -> str:
+        """
+        Intelligent request routing, combining load awareness and cache hit rate prediction
+        
+        For requests with session ID, intelligent selection is made based on KV cache hit rate prediction and load conditions
+        For requests without session ID, engine selection is purely based on load balancing
+        """
+        # Extract session ID
+        session_id = request.headers.get(self.session_key, None)
+        logger.debug(f"Got session id: {session_id}")
+        
+        routing_method = "load_balancing"
+        
+        if session_id is None:
+            # No session ID, use pure load balancing strategy
+            engine_url = min(
+                [e.url for e in endpoints],
+                key=lambda url: self._calculate_engine_load_score(url, engine_stats, request_stats)
+            )
+            routing_method = "load_based"
+        else:
+            # Has session ID, use comprehensive strategy
+            engine_url, routing_method = self._select_best_engine(session_id, endpoints, engine_stats, request_stats)
+            
+        return engine_url, routing_method
+
+
 class KvawareRouter(RoutingInterface):
     """
     Route the request to the appropriate engine URL by where the KV cache
