@@ -21,6 +21,7 @@ import uuid
 import httpx
 from fastapi import BackgroundTasks, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from vllm_router.request_logger import request_logger
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
@@ -69,6 +70,7 @@ async def process_request(
     request_id,
     endpoint,
     background_tasks: BackgroundTasks,
+    routing_method=None,
     debug_request=None,
 ):
     """
@@ -80,6 +82,7 @@ async def process_request(
         backend_url: The URL of the backend to send the request to.
         request_id: A unique identifier for the request.
         endpoint: The endpoint to send the request to on the backend.
+        routing_method: The routing method used to select this backend.
         debug_request: The original request object from the client, used for
             optional debug logging.
 
@@ -93,7 +96,7 @@ async def process_request(
     total_len = 0
     start_time = time.time()
     request.app.state.request_stats_monitor.on_new_request(
-        backend_url, request_id, start_time
+        backend_url, request_id, start_time, routing_method
     )
     # Check if this is a streaming request
     is_streaming = False
@@ -261,11 +264,11 @@ async def route_general_request(
     elif isinstance(request.app.state.router, KvawareRouter) or isinstance(
         request.app.state.router, PrefixAwareRouter
     ):
-        server_url = await request.app.state.router.route_request(
+        server_url, routing_method = await request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
         )
     else:
-        server_url = request.app.state.router.route_request(
+        server_url, routing_method = request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request
         )
 
@@ -290,8 +293,17 @@ async def route_general_request(
     logger.debug(f"Debug session extraction - Extracted session ID: {session_id}")
 
     logger.info(
-        f"Routing request {request_id} with session id {session_id_display} to {server_url} at {curr_time}, process time = {curr_time - in_router_time:.4f}"
+        f"Routing request {request_id} with session id {session_id_display} to {server_url} at {curr_time}, "
+        f"process time = {curr_time - in_router_time:.4f}, "
+        f"routing method = {routing_method}"
     )
+
+    # record the request
+    request_logger.log_request_routed(in_router_time, request_id, routing_method, 
+                    server_url, session_id, process_time=curr_time - in_router_time)
+    # record the request body
+    request_logger.log_request_body(request_body, request_id)
+    
     stream_generator = process_request(
         request,
         request_body,
@@ -299,6 +311,7 @@ async def route_general_request(
         request_id,
         endpoint,
         background_tasks,
+        routing_method,
     )
     headers, status_code = await anext(stream_generator)
     headers_dict = {key: value for key, value in headers.items()}
