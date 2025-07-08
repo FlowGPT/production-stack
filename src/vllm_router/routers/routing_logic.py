@@ -647,8 +647,9 @@ class DisaggregatedPrefillRouter(RoutingInterface):
 def initialize_routing_logic(
     routing_logic: RoutingLogic, *args, **kwargs
 ) -> RoutingInterface:
-    
+
     from vllm_router.request_logger import request_logger
+
     if kwargs.get("enable_request_logging"):
         logger.info("Enabling request logging")
         request_logger.enable_logging(True, kwargs.get("request_log_dir"))
@@ -660,10 +661,11 @@ def initialize_routing_logic(
         logger.info(f"Initializing session-based routing logic with kwargs: {kwargs}")
         return SessionRouter(kwargs.get("session_key"))
     elif routing_logic == RoutingLogic.CACHE_AWARE_LOAD_BALANCING:
-        logger.info(f"Initializing cache-aware load balancing routing logic with kwargs: {kwargs}")
+        logger.info(
+            f"Initializing cache-aware load balancing routing logic with kwargs: {kwargs}"
+        )
         router = CacheAwareLoadBalancingRouter(
-            kwargs.get("session_key"),
-            kwargs.get("tolerate_waiting_requests")
+            kwargs.get("session_key"), kwargs.get("tolerate_waiting_requests")
         )
         return router
     elif routing_logic == RoutingLogic.KVAWARE:
@@ -699,16 +701,17 @@ def reconfigure_routing_logic(
     ):
         if cls in SingletonABCMeta._instances:
             del SingletonABCMeta._instances[cls]
-    
+
     # Re-configure request logging
     from vllm_router.request_logger import request_logger
+
     if kwargs.get("enable_request_logging"):
         logger.info("Re-enabling request logging with new configuration")
         request_logger.enable_logging(True, kwargs.get("request_log_dir"))
     else:
         # If request logging is not enabled, disable it
         request_logger.enable_logging(False)
-    
+
     return initialize_routing_logic(routing_logic, *args, **kwargs)
 
 

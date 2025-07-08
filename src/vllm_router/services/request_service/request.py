@@ -21,9 +21,9 @@ import uuid
 import httpx
 from fastapi import BackgroundTasks, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from vllm_router.request_logger import request_logger
 
 from vllm_router.log import init_logger
+from vllm_router.request_logger import request_logger
 from vllm_router.routers.routing_logic import (
     DisaggregatedPrefillRouter,
     KvawareRouter,
@@ -299,11 +299,17 @@ async def route_general_request(
     )
 
     # record the request
-    request_logger.log_request_routed(in_router_time, request_id, routing_method, 
-                    server_url, session_id, process_time=curr_time - in_router_time)
+    request_logger.log_request_routed(
+        in_router_time,
+        request_id,
+        routing_method,
+        server_url,
+        session_id,
+        process_time=curr_time - in_router_time,
+    )
     # record the request body
     request_logger.log_request_body(request_body, request_id)
-    
+
     stream_generator = process_request(
         request,
         request_body,
