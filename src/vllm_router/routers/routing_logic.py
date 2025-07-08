@@ -322,7 +322,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         ):
             # If queuing requests are less than tolerate_waiting_requests, use it directly
             logger.debug(
-                f"Session {session_id} initial engine waitting requests < {self.tolerate_waiting_requests}, route to: {initial_engine_url}"
+                f"Session {session_id} initial engine waiting requests < {self.tolerate_waiting_requests}, route to: {initial_engine_url}"
             )
             return initial_engine_url, routing_method
 
