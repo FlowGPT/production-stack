@@ -285,12 +285,12 @@ async def route_general_request(
     session_id_display = session_id if session_id is not None else "None"
 
     # Debug logging to help troubleshoot session ID extraction
-    logger.debug(
-        f"Debug session extraction - Router type: {type(request.app.state.router).__name__}"
-    )
-    logger.debug(f"Debug session extraction - Session key config: {session_key}")
-    logger.debug(f"Debug session extraction - Request headers: {dict(request.headers)}")
-    logger.debug(f"Debug session extraction - Extracted session ID: {session_id}")
+    # logger.debug(
+    #     f"Debug session extraction - Router type: {type(request.app.state.router).__name__}"
+    # )
+    # logger.debug(f"Debug session extraction - Session key config: {session_key}")
+    # logger.debug(f"Debug session extraction - Request headers: {dict(request.headers)}")
+    # logger.debug(f"Debug session extraction - Extracted session ID: {session_id}")
 
     logger.info(
         f"Routing request {request_id} with session id {session_id_display} to {server_url} at {curr_time}, "
