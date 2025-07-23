@@ -89,6 +89,7 @@ class RoutingInterface(metaclass=SingletonABCMeta):
         """
         Update the hash ring with the current list of endpoints.
         """
+        # logger.debug(f"Updating hash ring with endpoints: {endpoints}")
         # Extract endpoint URLs
         endpoint_urls = [endpoint.url for endpoint in endpoints]
 
@@ -159,7 +160,8 @@ class RoundRobinRouter(RoutingInterface):
         len_engines = len(endpoints)
         chosen = sorted(endpoints, key=lambda e: e.url)[self.req_id % len_engines]
         self.req_id += 1
-        return chosen.url
+        routing_method = "round_robin"
+        return chosen.url, routing_method
 
 
 class SessionRouter(RoutingInterface):
@@ -211,7 +213,14 @@ class SessionRouter(RoutingInterface):
             # Use the hash ring to get the endpoint for the session ID
             url = self.hash_ring.get_node(session_id)
 
-        return url
+            # If the initial engine is not found in engine_stats
+            if url not in engine_stats:
+                logger.warning(
+                    f"Engine {url} not found in engine_stats"
+                )
+
+        routing_method = "session_based"
+        return url, routing_method
 
 
 class CacheAwareLoadBalancingRouter(RoutingInterface):
@@ -272,27 +281,6 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
 
         return total_load_score
 
-    def _update_hash_ring(self, endpoints: List["EndpointInfo"]):
-        """
-        Update the hash ring with the current list of endpoints.
-        """
-        # Extract endpoint URLs
-        endpoint_urls = [endpoint.url for endpoint in endpoints]
-
-        # Get the current nodes in the hash ring
-        current_nodes = set(self.hash_ring.get_nodes())
-
-        # Convert the new endpoint URLs to a set for easy comparison
-        new_nodes = set(endpoint_urls)
-
-        # Remove nodes that are no longer in the list
-        for node in current_nodes - new_nodes:
-            self.hash_ring.remove_node(node)
-
-        # Add new nodes that are not already in the hash ring
-        for node in new_nodes - current_nodes:
-            self.hash_ring.add_node(node)
-
     def _select_best_engine(
         self,
         session_id: str,
@@ -314,7 +302,12 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         # Use hash_ring to get the initial engine_url
         initial_engine_url = self.hash_ring.get_node(session_id)
 
-        routing_method = "cache_aware"
+        # If the initial engine is not found in engine_stats
+        if initial_engine_url not in engine_stats:
+            logger.warning(
+                f"Engine {initial_engine_url} not found in engine_stats"
+            )
+            return initial_engine_url, "cache_aware"
 
         # Check the queuing situation of the initial engine
         if (
@@ -325,7 +318,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             logger.debug(
                 f"Session {session_id} initial engine waiting requests < {self.tolerate_waiting_requests}, route to: {initial_engine_url}"
             )
-            return initial_engine_url, routing_method
+            return initial_engine_url, "cache_aware"
 
         # Try to find engines without queue
         engines_without_queue = []
@@ -720,6 +713,7 @@ def get_routing_logic() -> RoutingInterface:
     for cls in (
         SessionRouter,
         RoundRobinRouter,
+        CacheAwareLoadBalancingRouter,
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
