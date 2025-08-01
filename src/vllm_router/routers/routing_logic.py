@@ -324,36 +324,54 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         engines_without_queue = []
         for info in endpoints:
             url = info.url
-            if engine_stats[url].num_queuing_requests == 0:
+            # Add boundary check for engine_stats
+            if url in engine_stats and engine_stats[url].num_queuing_requests == 0:
                 engines_without_queue.append(url)
 
         # If there are engines without queue, randomly select one
         if engines_without_queue:
-            routing_method = "redirect_to_no_queue_engine"
             selected_engine = random.choice(engines_without_queue)
             logger.debug(
                 f"Session {session_id} redirect to no queue engine: {selected_engine}"
             )
-            return selected_engine, routing_method
+            return selected_engine, "redirect_to_no_queue_engine"
 
-        # All engines have queues, select one based on probability
+        # All engines have queues, select one based on improved probability calculation
         routing_method = "probability_based"
+        
+        # Filter endpoints that have engine stats
+        valid_endpoints = [info for info in endpoints if info.url in engine_stats]
+        if not valid_endpoints:
+            # Fallback to initial engine if no valid stats available
+            logger.warning("No valid engine stats available, falling back to initial engine")
+            return initial_engine_url, "cache_aware_fallback"
+        
+        # Calculate total queue length from valid endpoints only
         total_queue_length = sum(
-            engine_stats[url].num_queuing_requests
-            for url in [info.url for info in endpoints]
+            engine_stats[info.url].num_queuing_requests
+            for info in valid_endpoints
         )
-        probabilities = [
-            1 / (engine_stats[url].num_queuing_requests / total_queue_length)
-            for url in [info.url for info in endpoints]
-        ]
-        probabilities = [p / sum(probabilities) for p in probabilities]
+        
+        # Fixed probability calculation: inverse of normalized queue length
+        queue_lengths = [engine_stats[info.url].num_queuing_requests for info in valid_endpoints]
+        max_queue = max(queue_lengths)
+        
+        # Calculate inverse weights (higher weight for lower queue length)
+        # Add small epsilon to avoid division by zero
+        epsilon = 0.1
+        inverse_weights = [(max_queue - queue_len + epsilon) for queue_len in queue_lengths]
+        total_weight = sum(inverse_weights)
+        
+        # Normalize to probabilities
+        probabilities = [weight / total_weight for weight in inverse_weights]
 
         selected_engine = random.choices(
-            [info.url for info in endpoints], weights=probabilities
+            [info.url for info in valid_endpoints], weights=probabilities
         )[0]
 
         logger.debug(
-            f"Session {session_id} probability based routing to: {selected_engine}"
+            f"Session {session_id} probability based routing to: {selected_engine}, "
+            f"queue_lengths: {queue_lengths}, probabilities: {[f'{p:.3f}' for p in probabilities]}"
         )
         return selected_engine, routing_method
 
