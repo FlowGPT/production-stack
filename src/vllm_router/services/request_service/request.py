@@ -28,6 +28,7 @@ from vllm_router.routers.routing_logic import (
     DisaggregatedPrefillRouter,
     KvawareRouter,
     PrefixAwareRouter,
+    ELRARRouter,
 )
 from vllm_router.service_discovery import get_service_discovery
 from vllm_router.services.request_service.rewriter import (
@@ -266,6 +267,20 @@ async def route_general_request(
     ):
         server_url, routing_method = await request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
+        )
+    elif isinstance(request.app.state.router, ELRARRouter):
+        engine_states = None
+        try:
+            from vllm_router.services.state_gateway.gateway import get_state_gateway
+            gateway = get_state_gateway()
+            # 使用Gateway提供的公共方法获取状态
+            engine_states = gateway.get_engine_states_dict()
+        except Exception as e:
+            # 如果导入或访问失败，保持 engine_states = None
+            logger.info(f"Failed to get engine states from Gateway: {e}")
+            pass
+        server_url, routing_method = request.app.state.router.route_request(
+            endpoints, engine_stats, request_stats, request, engine_states
         )
     else:
         server_url, routing_method = request.app.state.router.route_request(

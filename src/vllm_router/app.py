@@ -263,6 +263,17 @@ def initialize_all(app: FastAPI, args):
     app.state.request_stats_monitor = get_request_stats_monitor()
     app.state.router = get_routing_logic()
     app.state.request_rewriter = get_request_rewriter()
+    
+    # 如果使用 ELRAR Router，自动启动 State Gateway
+    if hasattr(app.state.router, '__class__') and app.state.router.__class__.__name__ == 'ELRARRouter':
+        try:
+            from vllm_router.services.state_gateway.gateway import get_state_gateway
+            # 这会自动启动 Gateway 的 UDP 监听器
+            gateway = get_state_gateway()
+            logger.info("ELRAR State Gateway (UDP) auto-started for ELRAR Router")
+        except Exception as e:
+            logger.warning(f"Failed to auto-start State Gateway: {e}")
+            logger.info("Please manually start State Gateway for ELRAR functionality")
 
 
 app = FastAPI(lifespan=lifespan)

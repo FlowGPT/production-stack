@@ -1,0 +1,278 @@
+# ELRAR State Gateway UDP 点播模式配置示例
+# 适用于 Kubernetes 环境
+
+# =============================================================================
+# 1. 环境变量配置
+# =============================================================================
+
+# 基本配置
+export VLLM_STATE_GATEWAY_UDP_PORT="9999"
+export VLLM_STATE_GATEWAY_STALE_THRESHOLD="2000"
+
+# 网络模式配置
+export VLLM_STATE_GATEWAY_NETWORK_MODE="unicast"  # "unicast" | "broadcast"
+export VLLM_STATE_GATEWAY_BIND_ADDRESS="0.0.0.0"  # 绑定地址（Docker/K8s环境推荐）
+
+# 日志配置
+export VLLM_STATE_GATEWAY_ENABLE_LOG="true"
+export VLLM_STATE_GATEWAY_LOG_FILE="engine_states.jsonl"
+
+# =============================================================================
+# 2. Docker 运行配置
+# =============================================================================
+
+# 重要说明：
+# 在 Docker 环境中，bind_address 应该设置为 "0.0.0.0"，而不是具体的 IP 地址
+# 原因：
+# 1. 容器内的网络命名空间与宿主机不同
+# 2. Pod IP 是动态的，每次重启都可能变化
+# 3. 应该依赖 Docker 网络和 K8s Service 进行服务发现
+
+# 使用环境变量运行
+# 方式1：使用 host 网络模式（推荐用于单机部署）
+docker run -d \
+  --name elrar-state-gateway \
+  --network host \
+  -e VLLM_STATE_GATEWAY_NETWORK_MODE=unicast \
+  -e VLLM_STATE_GATEWAY_UDP_PORT=9999 \
+  -e VLLM_STATE_GATEWAY_BIND_ADDRESS=0.0.0.0 \
+  -e VLLM_STATE_GATEWAY_STALE_THRESHOLD=2000 \
+  -e VLLM_STATE_GATEWAY_ENABLE_LOG=true \
+  -e VLLM_STATE_GATEWAY_LOG_FILE=/data/engine_states.jsonl \
+  -v /tmp/elrar:/data \
+  elrar/state-gateway:latest
+
+# 方式2：使用桥接网络模式（推荐用于容器化部署）
+docker run -d \
+  --name elrar-state-gateway \
+  --network bridge \
+  -p 9999:9999/udp \
+  -e VLLM_STATE_GATEWAY_NETWORK_MODE=unicast \
+  -e VLLM_STATE_GATEWAY_UDP_PORT=9999 \
+  -e VLLM_STATE_GATEWAY_BIND_ADDRESS=0.0.0.0 \
+  -e VLLM_STATE_GATEWAY_STALE_THRESHOLD=2000 \
+  -e VLLM_STATE_GATEWAY_ENABLE_LOG=true \
+  -e VLLM_STATE_GATEWAY_LOG_FILE=/data/engine_states.jsonl \
+  -v /tmp/elrar:/data \
+  elrar/state-gateway:latest
+
+# =============================================================================
+# 3. Kubernetes 配置
+# =============================================================================
+
+# 重要说明：
+# 在 Kubernetes 环境中：
+# 1. bind_address 应该设置为 "0.0.0.0"，绑定到所有网络接口
+# 2. 不要设置为具体的 Pod IP，因为 Pod IP 是动态的
+# 3. 使用 K8s Service 进行服务发现和负载均衡
+# 4. 网络策略控制流量访问权限
+
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elrar-state-gateway-config
+  namespace: vllm
+data:
+    # 环境变量配置
+  VLLM_STATE_GATEWAY_NETWORK_MODE: "unicast"
+  VLLM_STATE_GATEWAY_UDP_PORT: "9999"
+  VLLM_STATE_GATEWAY_BIND_ADDRESS: "0.0.0.0"  # 绑定到所有网络接口
+  VLLM_STATE_GATEWAY_STALE_THRESHOLD: "2000"
+  VLLM_STATE_GATEWAY_ENABLE_LOG: "true"
+  VLLM_STATE_GATEWAY_LOG_FILE: "/data/engine_states.jsonl"
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elrar-state-gateway
+  namespace: vllm
+  labels:
+    app: elrar-state-gateway
+    component: state-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elrar-state-gateway
+  template:
+    metadata:
+      labels:
+        app: elrar-state-gateway
+        component: state-gateway
+    spec:
+      containers:
+      - name: state-gateway
+        image: elrar/state-gateway:latest
+        ports:
+        - containerPort: 9999
+          name: udp
+          protocol: UDP
+        envFrom:
+        - configMapRef:
+            name: elrar-state-gateway-config
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "ps aux | grep python | grep gateway"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "netstat -un | grep :9999"
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: data-volume
+        emptyDir: {}
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: elrar-state-gateway
+  namespace: vllm
+  labels:
+    app: elrar-state-gateway
+    component: state-gateway
+spec:
+  selector:
+    app: elrar-state-gateway
+  ports:
+    - name: udp
+      protocol: UDP
+      port: 9999
+      targetPort: 9999
+  type: ClusterIP
+
+# =============================================================================
+# 4. 网络策略配置
+# =============================================================================
+
+# NetworkPolicy (可选)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elrar-state-gateway-policy
+  namespace: vllm
+spec:
+  podSelector:
+    matchLabels:
+      app: elrar-state-gateway
+  policyTypes:
+  - Ingress
+  ingress:
+  # 允许 UDP 流量到 State Gateway
+  - from:
+    - podSelector:
+        matchLabels:
+          component: inference-engine
+    ports:
+    - protocol: UDP
+      port: 9999
+
+# =============================================================================
+# 5. 启动脚本
+# =============================================================================
+
+#!/bin/bash
+# start_gateway_unicast.sh
+
+# 设置环境变量
+export VLLM_STATE_GATEWAY_NETWORK_MODE="unicast"
+export VLLM_STATE_GATEWAY_UDP_PORT="9999"
+export VLLM_STATE_GATEWAY_BIND_ADDRESS="0.0.0.0"  # Docker/K8s环境推荐
+export VLLM_STATE_GATEWAY_STALE_THRESHOLD="2000"
+export VLLM_STATE_GATEWAY_ENABLE_LOG="true"
+export VLLM_STATE_GATEWAY_LOG_FILE="engine_states.jsonl"
+
+# 启动 State Gateway
+echo "Starting ELRAR State Gateway in unicast mode..."
+echo "Network Mode: $VLLM_STATE_GATEWAY_NETWORK_MODE"
+echo "Bind Address: $VLLM_STATE_GATEWAY_BIND_ADDRESS"
+echo "UDP Port: $VLLM_STATE_GATEWAY_UDP_PORT"
+echo "Stale Threshold: ${VLLM_STATE_GATEWAY_STALE_THRESHOLD}ms"
+
+python gateway.py
+
+# =============================================================================
+# 6. 测试配置
+# =============================================================================
+
+# 测试 UDP 连通性
+nc -zu localhost 9999
+
+# 测试状态接收
+echo '{"engine_id":"test-engine","timestamp_ms":1234567890,"latency_pred_ms":100.0,"scheduling_mode":"latency_optimized","pending_tokens_total":10,"kv_cache_free_blocks":100,"kv_cache_total_blocks":1000,"engine_capacity":1000.0}' | nc -u localhost 9999
+
+# 查看日志
+tail -f engine_states.jsonl
+
+# 查看统计信息
+curl -s http://localhost:8080/stats | jq .
+
+# =============================================================================
+# 7. 配置说明
+# =============================================================================
+
+# 网络模式选择：
+# - unicast: 点播模式，推荐用于 K8s 环境
+#   - 优点：跨网络通信，目标明确，网络友好
+#   - 适用：Kubernetes、Docker、云环境
+#
+# - broadcast: 广播模式，向后兼容
+#   - 优点：简单配置，本地网络友好
+#   - 适用：本地开发、单机部署
+
+# 绑定地址配置：
+# - 0.0.0.0: 绑定到所有网络接口（Docker/K8s环境推荐）
+#   - 原因：容器网络命名空间隔离，需要绑定到所有接口
+#   - 适用：Docker、Kubernetes、云环境
+# - 127.0.0.1: 仅绑定到本地回环接口
+#   - 原因：仅允许本机访问，网络隔离
+#   - 适用：本地开发、单机测试
+# - 具体IP: 绑定到特定网络接口（不推荐用于容器环境）
+#   - 原因：Pod IP 动态变化，网络配置复杂
+#   - 适用：固定网络环境的传统部署
+
+# 端口配置：
+# - 9999: 默认端口，可自定义
+# - 确保防火墙/网络策略允许该端口
+
+# 状态陈旧阈值：
+# - 2000ms: 默认值，2秒内未更新的状态视为陈旧
+# - 根据网络延迟调整，建议设置为推送间隔的 5-10 倍
+
+# =============================================================================
+# 8. 故障排除
+# =============================================================================
+
+# 常见问题：
+# 1. 端口被占用：netstat -un | grep :9999
+# 2. 权限不足：sudo 运行或检查端口权限
+# 3. 网络不通：检查防火墙和网络策略
+# 4. 状态不更新：检查 vLLM 引擎配置
+
+# 调试命令：
+# - 查看日志：tail -f engine_states.jsonl
+# - 检查端口：netstat -un | grep :9999
+# - 测试连通：nc -zu localhost 9999
+# - 查看进程：ps aux | grep gateway

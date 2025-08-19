@@ -188,6 +188,7 @@ def parse_args():
             "kvaware",
             "prefixaware",
             "disaggregated_prefill",
+            "elrar",
         ],
         help="The routing logic to use",
     )

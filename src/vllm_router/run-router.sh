@@ -17,15 +17,15 @@ fi
 # Use this command when testing with static service discovery
 python3 -m vllm_router.app --port "$1" \
     --service-discovery static \
-    --static-backends "http://localhost:8000" \
-    --static-models "facebook/opt-125m" \
+    --static-backends "http://localhost:8769" \
+    --static-models "meta-llama/Llama-3.1-8B-Instruct" \
     --static-model-types "chat" \
     --log-stats \
     --log-stats-interval 10 \
     --engine-stats-interval 10 \
     --request-stats-window 10 \
-    --request-stats-window 10 \
-    --routing-logic roundrobin
+    --session-key "X-Flow-Conversation-Id" \
+    --routing-logic elrar
 
 # Use this command when testing with roundrobin routing logic
 #python3 router.py --port "$1" \
