@@ -17,15 +17,17 @@ fi
 # Use this command when testing with static service discovery
 python3 -m vllm_router.app --port "$1" \
     --service-discovery static \
-    --static-backends "http://localhost:8769" \
-    --static-models "meta-llama/Llama-3.1-8B-Instruct" \
+    --static-backends "http://65.49.81.73:8769,http://184.105.87.202:8769" \
+    --static-models "meta-llama/Llama-3.1-8B-Instruct,meta-llama/Llama-3.1-8B-Instruct" \
     --static-model-types "chat" \
     --log-stats \
     --log-stats-interval 10 \
     --engine-stats-interval 10 \
     --request-stats-window 10 \
     --session-key "X-Flow-Conversation-Id" \
-    --routing-logic elrar
+    --routing-logic latency_based
+
+# --engine-weights "{\"http://65.49.81.73:8769\": 1, \"http://184.105.87.202:8769\": 1}"
 
 # Use this command when testing with roundrobin routing logic
 #python3 router.py --port "$1" \

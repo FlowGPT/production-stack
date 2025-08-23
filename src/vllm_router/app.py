@@ -199,6 +199,8 @@ def initialize_all(app: FastAPI, args):
         kv_aware_threshold=args.kv_aware_threshold,
         enable_request_logging=args.enable_request_logging,
         request_log_dir=args.request_log_dir,
+        latency_type=args.latency_type,
+        engine_weights=args.engine_weights,
     )
 
     # Initialize feature gates

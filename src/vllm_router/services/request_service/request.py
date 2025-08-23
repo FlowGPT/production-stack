@@ -29,6 +29,7 @@ from vllm_router.routers.routing_logic import (
     KvawareRouter,
     PrefixAwareRouter,
     ELRARRouter,
+    WeightBaseRouter,
 )
 from vllm_router.service_discovery import get_service_discovery
 from vllm_router.services.request_service.rewriter import (
@@ -268,7 +269,7 @@ async def route_general_request(
         server_url, routing_method = await request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
         )
-    elif isinstance(request.app.state.router, ELRARRouter):
+    elif isinstance(request.app.state.router, ELRARRouter) or isinstance(request.app.state.router, WeightBaseRouter):
         engine_states = None
         try:
             from vllm_router.services.state_gateway.gateway import get_state_gateway

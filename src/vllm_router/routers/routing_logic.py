@@ -60,6 +60,9 @@ class RoutingLogic(str, enum.Enum):
     PREFIXAWARE = "prefixaware"
     DISAGGREGATED_PREFILL = "disaggregated_prefill"
     ELRAR = "elrar"
+    LEAST_LOADED = "least_loaded"
+    LATENCY_BASED = "latency_based"
+    WEIGHT_BASED = "weight_based"
 
 
 class RoutingInterface(metaclass=SingletonABCMeta):
@@ -117,7 +120,7 @@ class RoutingInterface(metaclass=SingletonABCMeta):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-    ) -> str:
+    ) -> Tuple[str, str]:
         """
         Route the request to the appropriate engine URL
 
@@ -128,6 +131,9 @@ class RoutingInterface(metaclass=SingletonABCMeta):
             request_stats (Dict[str, RequestStats]): The request stats
                 indicating the request-level performance of each engine
             request (Request): The incoming request
+            
+        Returns:
+            Tuple[str, str]: A tuple containing (selected_engine_url, routing_method)
         """
         raise NotImplementedError
 
@@ -147,7 +153,7 @@ class RoundRobinRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-    ) -> str:
+    ) -> Tuple[str, str]:
         """
         Route the request to the appropriate engine URL using a simple
         round-robin algorithm
@@ -188,7 +194,7 @@ class SessionRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-    ) -> str:
+    ) -> Tuple[str, str]:
         """
         Route the request to the appropriate engine URL by the 'session id' in
         the request headers.
@@ -384,7 +390,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request_stats: Dict[str, RequestStats],
         request: Request,
-    ) -> str:
+    ) -> Tuple[str, str]:
         """
         Intelligent request routing, combining load awareness and cache hit rate prediction
 
@@ -849,7 +855,7 @@ class ELRARRouter(RoutingInterface):
         request_stats: Dict[str, RequestStats],
         request: Request,
         engine_states: Optional[Dict[str, Dict]] = None,
-    ) -> str:        
+    ) -> Tuple[str, str]:        
         session_id = request.headers.get(self.session_key, None)
 
         # 优先使用调用方传入的 engine_states
@@ -894,6 +900,277 @@ class ELRARRouter(RoutingInterface):
 
         routing_method = "elrar_scored"
         return best_url, routing_method
+
+
+class LeastLoadedRouter(RoutingInterface):
+    """
+    路由到排队请求数最少的engine。如果存在多个engine具有相同的最少排队请求数，则随机选择一个。
+    """
+
+    def __init__(self):
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+
+    def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+    ) -> Tuple[str, str]:
+        """
+        将请求路由到排队请求数最少的engine
+
+        Args:
+            endpoints (List[EndpointInfo]): 引擎URL列表
+            engine_stats (Dict[str, EngineStats]): 引擎统计信息
+            request_stats (Dict[str, RequestStats]): 请求统计信息
+            request (Request): 传入的请求
+        """
+        if not endpoints:
+            raise ValueError("No endpoints available")
+
+        # 找到排队请求数最少的engine(s)
+        min_queuing_requests = float("inf")
+        candidate_engines = []
+
+        for endpoint in endpoints:
+            url = endpoint.url
+            if url in engine_stats:
+                queuing_requests = engine_stats[url].num_queuing_requests
+                if queuing_requests < min_queuing_requests:
+                    min_queuing_requests = queuing_requests
+                    candidate_engines = [url]
+                elif queuing_requests == min_queuing_requests:
+                    candidate_engines.append(url)
+            else:
+                # 如果没有统计信息，假设该engine没有排队请求
+                if 0 < min_queuing_requests:
+                    min_queuing_requests = 0
+                    candidate_engines = [url]
+                elif 0 == min_queuing_requests:
+                    candidate_engines.append(url)
+
+        # 如果有多个候选engine，随机选择一个
+        selected_engine = random.choice(candidate_engines)
+        routing_method = "least_loaded"
+        
+        logger.debug(
+            f"LeastLoadedRouter selected {selected_engine} from {len(candidate_engines)} "
+            f"candidates with {min_queuing_requests} queuing requests"
+        )
+        
+        return selected_engine, routing_method
+
+
+class LatencyBaseRouter(RoutingInterface):
+    """
+    基于延迟的路由器，支持E2E（端到端）和TTFT（首次token时间）两种延迟指标。
+    将请求路由到对应指标延迟最低的engine。
+    """
+
+    def __init__(self, latency_type: str = "e2e"):
+        if hasattr(self, "_initialized"):
+            return
+        
+        if latency_type not in ["e2e", "ttft", "tpot"]:
+            raise ValueError("latency_type must be one of 'e2e', 'ttft', or 'tpot'")
+        
+        self.latency_type = latency_type
+        self._initialized = True
+
+    def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+    ) -> Tuple[str, str]:
+        """
+        将请求路由到延迟最低的engine
+
+        Args:
+            endpoints (List[EndpointInfo]): 引擎URL列表
+            engine_stats (Dict[str, EngineStats]): 引擎统计信息
+            request_stats (Dict[str, RequestStats]): 请求统计信息
+            request (Request): 传入的请求
+        """
+        if not endpoints:
+            raise ValueError("No endpoints available")
+
+        best_engine = None
+        best_latency = float("inf")
+        candidate_engines = []
+
+        for endpoint in endpoints:
+            url = endpoint.url
+            if url in request_stats:
+                request_stat = request_stats[url]
+                
+                # 根据延迟类型选择相应的延迟指标
+                if self.latency_type == "e2e":
+                    latency = request_stat.avg_latency
+                elif self.latency_type == "tpot":
+                    latency = request_stat.avg_itl
+                else:  # ttft
+                    latency = request_stat.ttft
+                
+                if latency is not None:
+                    if latency < best_latency:
+                        best_latency = latency
+                        candidate_engines = [url]
+                    elif latency == best_latency:
+                        candidate_engines.append(url)
+            else:
+                # 如果没有延迟统计信息，将其视为候选（延迟为0）
+                if 0 < best_latency:
+                    best_latency = 0
+                    candidate_engines = [url]
+                elif best_latency == 0:
+                    candidate_engines.append(url)
+
+        # 如果没有找到合适的engine，回退到第一个可用的
+        if not candidate_engines:
+            best_engine = endpoints[0].url
+            logger.warning(
+                f"No engines with {self.latency_type} latency stats found, "
+                f"falling back to first available: {best_engine}"
+            )
+        else:
+            # 如果有多个具有相同最低延迟的engine，随机选择一个
+            best_engine = random.choice(candidate_engines)
+
+        routing_method = f"latency_based_{self.latency_type}"
+        
+        logger.debug(
+            f"LatencyBaseRouter ({self.latency_type}) selected {best_engine} "
+            f"with latency {best_latency:.3f} from {len(candidate_engines)} candidates"
+        )
+        
+        return best_engine, routing_method
+
+
+class WeightBaseRouter(RoutingInterface):
+    """
+    基于权重的路由器，按照指定的权重比例分配流量到不同的engine。
+    支持动态权重调整。
+    """
+
+    def __init__(self, engine_weights: Dict[str, float] = None):
+        if hasattr(self, "_initialized"):
+            return
+        
+        # engine_url -> weight的映射
+        self.engine_weights = engine_weights or {}
+        self.default_weight = 1.0
+        self.request_counter = 0
+        self._initialized = True
+
+    def set_weights(self, engine_weights: Dict[str, float]):
+        """动态设置engine权重"""
+        self.engine_weights = engine_weights.copy()
+        logger.info(f"Updated engine weights: {self.engine_weights}")
+
+    def _get_capacity_based_weights(
+        self, 
+        available_engines: List[str], 
+        engine_states: Dict[str, Dict]
+    ) -> Dict[str, float]:
+        """从engine_states中获取基于capacity的权重"""
+        capacity_weights = {}
+        for engine_url in available_engines:
+            # 尝试从engine_states获取capacity
+            capacity = 0.0
+            for state_key, state_value in engine_states.items():
+                # 支持多种匹配方式：直接URL匹配或包含URL的key
+                if (state_key == engine_url or 
+                    engine_url in state_key or 
+                    state_key in engine_url):
+                    capacity = float(state_value.get("engine_capacity", 0) or 0)
+                    break
+            
+            # 使用capacity/1000作为权重，最小权重为0.01
+            weight = max(capacity / 1000.0, 0.01) if capacity > 0 else 0.01
+            capacity_weights[engine_url] = weight
+            
+        return capacity_weights
+
+    def _calculate_weighted_selection(
+        self, 
+        available_engines: List[str], 
+        effective_weights: Dict[str, float]
+    ) -> str:
+        """基于权重进行加权随机选择"""
+        if not available_engines:
+            raise ValueError("No available engines")
+
+        # 获取每个engine的权重
+        weights = []
+        for engine_url in available_engines:
+            weight = effective_weights.get(engine_url, self.default_weight)
+            weights.append(max(weight, 0.01))  # 确保权重至少为0.01，避免某些engine完全被忽略
+
+        # 使用random.choices进行加权随机选择
+        selected_engine = random.choices(available_engines, weights=weights)[0]
+        return selected_engine
+
+    def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+        engine_states: Optional[Dict[str, Dict]] = None,
+    ) -> Tuple[str, str]:
+        """
+        根据权重将请求路由到相应的engine
+
+        Args:
+            endpoints (List[EndpointInfo]): 引擎URL列表
+            engine_stats (Dict[str, EngineStats]): 引擎统计信息
+            request_stats (Dict[str, RequestStats]): 请求统计信息
+            request (Request): 传入的请求
+            engine_states (Optional[Dict[str, Dict]]): 引擎状态信息，用于获取capacity权重
+        """
+        if not endpoints:
+            raise ValueError("No endpoints available")
+
+        self.request_counter += 1
+        available_engines = [endpoint.url for endpoint in endpoints]
+
+        # 确定使用的权重：优先使用配置权重，否则使用capacity权重
+        effective_weights = {}
+        routing_method = "weight_based_uniform"
+        
+        if self.engine_weights:
+            # 使用配置的权重
+            effective_weights = self.engine_weights
+            routing_method = "weight_based_configured"
+        elif engine_states:
+            # 使用基于capacity的权重
+            effective_weights = self._get_capacity_based_weights(available_engines, engine_states)
+            routing_method = "weight_based_capacity"
+        
+        if effective_weights:
+            # 根据权重进行选择
+            selected_engine = self._calculate_weighted_selection(available_engines, effective_weights)
+            
+            # 记录权重信息用于调试
+            engine_weight = effective_weights.get(selected_engine, self.default_weight)
+            logger.debug(
+                f"WeightBaseRouter selected {selected_engine} "
+                f"(weight: {engine_weight}, method: {routing_method}) from {len(available_engines)} engines"
+            )
+        else:
+            # 回退到均匀分布
+            selected_engine = random.choice(available_engines)
+            logger.debug(
+                f"No weights available, using uniform distribution. "
+                f"Selected: {selected_engine}"
+            )
+
+        return selected_engine, routing_method
 
 
 # Instead of managing a global _global_router, we can define the initialization functions as:
@@ -942,6 +1219,24 @@ def initialize_routing_logic(
         logger.info("Initializing ELRAR routing logic")
         return ELRARRouter(
             kwargs.get("session_key"))
+    elif routing_logic == RoutingLogic.LEAST_LOADED:
+        logger.info("Initializing LeastLoadedRouter routing logic")
+        return LeastLoadedRouter()
+    elif routing_logic == RoutingLogic.LATENCY_BASED:
+        logger.info("Initializing LatencyBaseRouter routing logic")
+        return LatencyBaseRouter(kwargs.get("latency_type"))
+    elif routing_logic == RoutingLogic.WEIGHT_BASED:
+        logger.info("Initializing WeightBaseRouter routing logic")
+        engine_weights = kwargs.get("engine_weights")
+        # 如果engine_weights是字符串，解析为字典
+        if isinstance(engine_weights, str) and engine_weights:
+            import json
+            try:
+                engine_weights = json.loads(engine_weights)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse engine_weights JSON: {e}")
+                engine_weights = None
+        return WeightBaseRouter(engine_weights)
     else:
         raise ValueError(f"Invalid routing logic {routing_logic}")
 
@@ -956,6 +1251,9 @@ def reconfigure_routing_logic(
         KvawareRouter,
         DisaggregatedPrefillRouter,
         ELRARRouter,
+        LeastLoadedRouter,
+        LatencyBaseRouter,
+        WeightBaseRouter,
     ):
         if cls in SingletonABCMeta._instances:
             del SingletonABCMeta._instances[cls]
@@ -983,6 +1281,9 @@ def get_routing_logic() -> RoutingInterface:
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
         ELRARRouter,
+        LeastLoadedRouter,
+        LatencyBaseRouter,
+        WeightBaseRouter,
     ):
         if cls in SingletonABCMeta._instances:
             return cls()

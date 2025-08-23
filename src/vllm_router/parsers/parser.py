@@ -103,6 +103,11 @@ def validate_args(args):
         raise ValueError(
             "Session key must be provided when using cache_aware_load_balancing routing logic."
         )
+    # 新路由策略的参数验证
+    if args.routing_logic == "latency_based" and args.latency_type is None:
+        raise ValueError(
+            "Latency type must be provided when using latency_based routing logic."
+        )
     if args.log_stats and args.log_stats_interval <= 0:
         raise ValueError("Log stats interval must be greater than 0.")
     if args.engine_stats_interval <= 0:
@@ -189,6 +194,9 @@ def parse_args():
             "prefixaware",
             "disaggregated_prefill",
             "elrar",
+            "least_loaded",
+            "latency_based",
+            "weight_based",
         ],
         help="The routing logic to use",
     )
@@ -352,6 +360,22 @@ def parse_args():
         type=int,
         default=2000,
         help="The threshold for kv-aware routing.",
+    )
+
+    # 新路由策略相关参数
+    parser.add_argument(
+        "--latency-type",
+        type=str,
+        choices=["e2e", "ttft", "tpot"],
+        default="e2e",
+        help="The latency type for latency-based routing. 'e2e' for end-to-end latency, 'ttft' for time to first token, 'tpot' for time per output token.",
+    )
+
+    parser.add_argument(
+        "--engine-weights",
+        type=str,
+        default=None,
+        help="JSON string specifying engine weights for weight-based routing. Format: '{\"http://engine1:8000\": 3.0, \"http://engine2:8000\": 2.0}'",
     )
 
     args = parser.parse_args()
