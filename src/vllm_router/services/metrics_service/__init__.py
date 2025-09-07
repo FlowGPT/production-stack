@@ -45,3 +45,10 @@ avg_itl = Gauge("vllm:avg_itl", "Average Inter-Token Latency", ["server"])
 num_requests_swapped = Gauge(
     "vllm:num_requests_swapped", "Number of swapped requests", ["server"]
 )
+
+# Routing method metrics
+routing_method_qps = Gauge(
+    "vllm:routing_method_qps", 
+    "Queries Per Second for different routing methods in the current time window", 
+    ["method"]
+)
