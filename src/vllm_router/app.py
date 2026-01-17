@@ -183,10 +183,13 @@ def initialize_all(app: FastAPI, args):
     initialize_routing_logic(
         args.routing_logic,
         session_key=args.session_key,
+        tolerate_waiting_requests=args.tolerate_waiting_requests,
         lmcache_controller_port=args.lmcache_controller_port,
         prefill_model_labels=args.prefill_model_labels,
         decode_model_labels=args.decode_model_labels,
         kv_aware_threshold=args.kv_aware_threshold,
+        enable_request_logging=args.enable_request_logging,
+        request_log_dir=args.request_log_dir,
     )
 
     # Initialize feature gates
