@@ -32,6 +32,7 @@ from vllm_router.services.metrics_service import (
     num_prefill_requests,
     num_requests_running,
     num_requests_swapped,
+    routing_method_qps,
 )
 from vllm_router.stats.engine_stats import get_engine_stats_scraper
 from vllm_router.stats.request_stats import get_request_stats_monitor
@@ -98,6 +99,27 @@ async def metrics():
         avg_latency.labels(server=server).set(stat.avg_latency)
         avg_itl.labels(server=server).set(stat.avg_itl)
         num_requests_swapped.labels(server=server).set(stat.num_swapped_requests)
+
+    # -----------------------------------------------------------------------------
+    
+    # Routing method QPS
+    routing_methods_qps = get_request_stats_monitor().get_routing_methods_qps()
+    # Save all known routing methods, for resetting
+    known_methods = set()
+    # Find registered routing method labels
+    for labels, _ in routing_method_qps._metrics.items():
+        if labels and len(labels) > 0:
+            method = labels[0]  # Assuming labels is (method,) format
+            known_methods.add(method)
+    # Reset QPS of all known but currently inactive routing methods to 0
+    for method in known_methods:
+        if method not in routing_methods_qps:
+            routing_method_qps.labels(method=method).set(0)
+    # Set QPS of currently active routing methods
+    for method, qps_value in routing_methods_qps.items():
+        routing_method_qps.labels(method=method).set(qps_value)
+
+    # -----------------------------------------------------------------------------
 
     # Engine statistics (GPU prefix cache metrics)
     engine_stats = get_engine_stats_scraper().get_engine_stats()
