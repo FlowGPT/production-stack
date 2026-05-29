@@ -140,7 +140,8 @@
 - 镜像：`vllm-router-cacheaware:c5` 构建 + 导入冒烟。
 
 ### 结果
-- 见提交后回填。
+- 单测 51 passed；lint 全过；commit `3ea4b49`（clean）。
+- 镜像 `vllm-router-cacheaware:c5` 构建成功；容器内 `initialize_routing_logic(CACHE_AWARE_LOAD_BALANCING, ...)` 正常，`window=30.0 thresholds={'p50_e2e':1.0,...}`，SMOKE_OK。
 
 ### 备注（真实 vLLM）
 - 路由改动不触碰代理/抓取路径（仅路由决策 + 指标），已用 stdlib mock 覆盖全部 queue/延迟/指标场景。
