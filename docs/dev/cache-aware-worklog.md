@@ -226,3 +226,27 @@
 - 任何"基于周期 scrape 的负载做路由决策"都必须叠加 **router 自身在途计数**，否则 scrape 盲窗内必然惊群；随机分发只是缓解，不解决。
 - 衰减窗口应贴近真实请求时长；过短退化为无计账，过长会过度分散（可经 `--cache-aware-inflight-decay` 调）。
 - 进一步可选项（未做，避免 over-engineering）：缩短 `--engine-stats-interval`、按精确完成回调而非时间衰减。
+
+---
+
+## C7 — 修复"在途计数按时间衰减"缺陷（#1）
+
+### 诊断（先证明缺陷真实存在）
+C6 的在途计数 `_pending` 按 `--cache-aware-inflight-decay`(5s) **时间衰减**，从不在请求真正完成时递减。若请求时长 > 衰减窗口，衰减会**提前忘记仍在跑的请求**，惊群回归。
+
+复现（`prove1.sh`，c6，候选请求 delay=12s，decay=5s）：
+- wave1：12 并发，candB 临时超限 → 全落 candA（candA in-flight=12，持续 12s）。
+- 治愈 candB；wave2 前断言 **candA 仍 in-flight=12**（确保测试有效）。
+- wave2：12 并发 → **candA 峰值 18 / candB 6**（理想 12/12）→ decay 忘记了 candA 上仍在跑的 12 个 → 惊群回归。**缺陷证实。**
+
+### 修复（最小、对症）
+- `src/vllm_router/routers/routing_logic.py`：`_pending` 改为**完成精确计数**——`_inflight: Dict[url, deque[ts]]`，派发时入队，`on_request_complete(url)` 出队；`_pending_load` 仅把 `inflight_decay` 当**安全上限**（丢弃从未观察到完成的泄漏项，如客户端断连）。请求在其**整个生命周期**内都计入其 engine，不再被固定窗口提前忘记。
+- `src/vllm_router/services/request_service/request.py`：`process_request` 完成处，除 monitor.on_request_complete 外，对实现了 `on_request_complete` 的 router（duck-typing，仅 cache_aware 有）回调递减在途。
+- `--cache-aware-inflight-decay` 语义改为"安全上限"，默认 5→**300**（>最长请求）。
+- 不变：粘滞/阈值判定、fallback 排序结构、热路径 O(1)。
+
+### 验证
+- TDD 新增：`test_completion_decrements_inflight`、`test_long_inflight_not_forgotten_until_complete`（100s 后仍计入，仅完成才清零）、`test_inflight_safety_cap_drops_unobserved`（泄漏兜底）。
+- 全量 `pytest src/tests/ --ignore=test-openai.py` → **68 passed**；black/ruff/codespell 全过。
+- 镜像 `:c7` 同一 `prove1.sh`（candA 确认 wave2 时仍 in-flight=12）：**candA 峰值 18→14、candB 6→10** → 惊群回归基本消除（candA 多出的 2 个是 wave1 真实完成后正确释放所致）。
+- 正常不回归：粘滞 session×8 全落单引擎；单波 40 并发 → candA/candB 各 20 均衡。

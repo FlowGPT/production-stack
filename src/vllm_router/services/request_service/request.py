@@ -122,6 +122,12 @@ async def process_request(
     request.app.state.request_stats_monitor.on_request_complete(
         backend_url, request_id, time.time()
     )
+    # Let overload-aware routers (cache-aware) decrement their in-flight count so
+    # fallback ranking reflects requests that have actually finished.
+    router = getattr(request.app.state, "router", None)
+    on_complete = getattr(router, "on_request_complete", None)
+    if callable(on_complete):
+        on_complete(backend_url)
 
     # if debug_request:
     #    logger.debug(f"Finished the request with request id: {debug_request.headers.get('x-request-id', None)} at {time.time()}")

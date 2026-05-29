@@ -273,13 +273,39 @@ def test_inflight_accounting_spreads_repeated_fallback():
     assert picks.count("http://e3") >= 4
 
 
-def test_inflight_decay_clears_pending():
+def test_inflight_safety_cap_drops_unobserved():
+    # Without a completion signal, the safety cap eventually drops leaked entries.
     r = _fresh_router(tolerate_waiting_requests=5, inflight_decay=5.0)
     r._record_dispatch(1000.0, "http://e2")
     r._record_dispatch(1000.0, "http://e2")
     assert r._pending_load("http://e2", 1000.0) == 2
-    # past the decay window the pending load is forgotten
     assert r._pending_load("http://e2", 1000.0 + 5.01) == 0
+
+
+def test_completion_decrements_inflight():
+    r = _fresh_router(tolerate_waiting_requests=5)
+    r._record_dispatch(1000.0, "http://e2")
+    r._record_dispatch(1000.0, "http://e2")
+    assert r._pending_load("http://e2", 1000.0) == 2
+    r.on_request_complete("http://e2")
+    assert r._pending_load("http://e2", 1000.0) == 1
+    r.on_request_complete("http://e2")
+    assert r._pending_load("http://e2", 1000.0) == 0
+    # extra completion is harmless
+    r.on_request_complete("http://e2")
+    assert r._pending_load("http://e2", 1000.0) == 0
+
+
+def test_long_inflight_not_forgotten_until_complete():
+    # Core #1 regression: a long-running request stays counted for its whole
+    # lifetime (well beyond any short window), not dropped on a fixed decay.
+    r = _fresh_router(tolerate_waiting_requests=5, inflight_decay=300.0)
+    r._record_dispatch(1000.0, "http://e2")
+    # 100s later (longer than the old 5s decay) it is still in flight
+    assert r._pending_load("http://e2", 1100.0) == 1
+    # only an actual completion clears it
+    r.on_request_complete("http://e2")
+    assert r._pending_load("http://e2", 1100.0) == 0
 
 
 def test_route_records_dispatch_for_chosen_engine():

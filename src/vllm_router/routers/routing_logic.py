@@ -244,7 +244,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         p50_e2e_threshold: float = 0.0,
         p99_e2e_threshold: float = 0.0,
         stats_window: float = 30.0,
-        inflight_decay: float = 5.0,
+        inflight_decay: float = 300.0,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -273,34 +273,38 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         self._win_fallback = 0
         self._win_reason: Counter = Counter()
 
-        # Recently dispatched targets, decayed over inflight_decay seconds. The
-        # scraped engine queue is up to --engine-stats-interval stale, so during
-        # a burst every fallback would otherwise pick the same lowest-queue
-        # engine (thundering herd). Counting requests this router just sent makes
-        # concurrent fallbacks see each other and self-disperse.
+        # Per-engine in-flight accounting. The scraped engine queue is up to
+        # --engine-stats-interval stale, so during a burst every fallback would
+        # otherwise pick the same lowest-queue engine (thundering herd).
+        # We count requests this router dispatched but has not yet seen complete,
+        # so concurrent fallbacks see each other and self-disperse, and a request
+        # stays counted for its WHOLE lifetime (not a fixed decay) -- a long
+        # request keeps loading its engine until it actually finishes.
+        # inflight_decay is only a safety cap that drops entries whose completion
+        # was never observed (e.g. client disconnect), to avoid leaking forever.
         self.inflight_decay = inflight_decay
-        self._dispatch_log: Deque[Tuple[float, str]] = deque()
-        self._pending: Counter = Counter()
+        self._inflight: Dict[str, Deque[float]] = {}
         self._initialized = True
 
-    def _evict_dispatches(self, now: float) -> None:
-        cutoff = now - self.inflight_decay
-        while self._dispatch_log and self._dispatch_log[0][0] < cutoff:
-            _, url = self._dispatch_log.popleft()
-            self._pending[url] -= 1
-            if self._pending[url] <= 0:
-                del self._pending[url]
-
     def _record_dispatch(self, now: float, url: str) -> None:
-        """Remember a request just routed to ``url`` (decayed in-flight load)."""
-        self._dispatch_log.append((now, url))
-        self._pending[url] += 1
-        self._evict_dispatches(now)
+        """Mark a request just routed to ``url`` as in-flight."""
+        self._inflight.setdefault(url, deque()).append(now)
+
+    def on_request_complete(self, url: str) -> None:
+        """Notify that one request to ``url`` finished (decrement in-flight)."""
+        dq = self._inflight.get(url)
+        if dq:
+            dq.popleft()
 
     def _pending_load(self, url: str, now: float) -> int:
-        """Number of recent dispatches to ``url`` still within the decay window."""
-        self._evict_dispatches(now)
-        return self._pending.get(url, 0)
+        """In-flight request count for ``url`` (completion-accurate, TTL-capped)."""
+        dq = self._inflight.get(url)
+        if not dq:
+            return 0
+        cutoff = now - self.inflight_decay
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        return len(dq)
 
     def _overload_snapshot(self) -> Dict[str, Dict[str, float]]:
         """Latency percentiles per engine; empty if the monitor is unavailable."""
@@ -342,9 +346,9 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     ):
         stats = engine_stats.get(url)
         queue = stats.num_queuing_requests if stats is not None else 0
-        # Add requests this router recently sent but the scrape has not yet seen,
+        # Add requests this router has in flight but the scrape has not yet seen,
         # so concurrent fallbacks spread instead of herding onto one engine.
-        effective_queue = queue + self._pending.get(url, 0)
+        effective_queue = queue + self._pending_load(url, now)
         p50_e2e = snapshot.get(url, {}).get("p50_e2e", -1)
         # Unknown latency (-1) is deprioritised in the tie-break.
         p50_e2e = p50_e2e if p50_e2e >= 0 else float("inf")
@@ -358,7 +362,6 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         snapshot: Dict[str, Dict[str, float]],
         now: float,
     ) -> str:
-        self._evict_dispatches(now)
         candidates = [
             e.url
             for e in endpoints

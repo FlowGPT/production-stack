@@ -224,11 +224,12 @@ def parse_args():
     parser.add_argument(
         "--cache-aware-inflight-decay",
         type=float,
-        default=5.0,
-        help="cache_aware_load_balancing: seconds a just-dispatched request is "
-        "counted as in-flight when ranking fallback targets. Lets concurrent "
-        "fallbacks spread instead of herding onto one engine while the engine "
-        "stats scrape is stale. Set near the typical request duration. Default 5.",
+        default=300.0,
+        help="cache_aware_load_balancing: safety cap (seconds) for in-flight "
+        "accounting. A dispatched request is counted as loading its engine until "
+        "it completes; this cap drops entries whose completion was never observed "
+        "(e.g. client disconnect) so they do not leak. Set above the longest "
+        "expected request. Default 300.",
     )
     parser.add_argument(
         "--lmcache-controller-port",
