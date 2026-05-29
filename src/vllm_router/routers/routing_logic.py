@@ -130,6 +130,15 @@ class RoutingInterface(metaclass=SingletonABCMeta):
         """
         raise NotImplementedError
 
+    def release_inflight(self, engine_url: str) -> None:
+        """
+        Notify the router that one request it dispatched to ``engine_url`` has
+        finished. Overload-aware routers use this to keep their in-flight count
+        accurate; the default is a no-op so the request path can call it on any
+        router unconditionally.
+        """
+        return None
+
 
 class RoundRobinRouter(RoutingInterface):
     # TODO (ApostaC): when available engines in the endpoints changes, the
@@ -230,6 +239,11 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     Overload is decided by per-engine thresholds; this layer wires the queue
     threshold (``tolerate_waiting_requests``). Latency percentile thresholds are
     added on top of the same ``_violated_reasons`` seam.
+
+    Concurrency: the mutable state (the window deque/counters and the in-flight
+    map) is only mutated from the asyncio event loop thread -- route_request and
+    release_inflight both run there -- so no lock is used. Do not call these from
+    a separate thread.
     """
 
     # All threshold names that can trigger a fallback (queue + latency).
@@ -294,14 +308,19 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         """Mark a request just routed to ``url`` as in-flight."""
         self._inflight.setdefault(url, deque()).append(now)
 
-    def on_request_complete(self, url: str) -> None:
-        """Notify that one request to ``url`` finished (decrement in-flight)."""
-        dq = self._inflight.get(url)
+    def release_inflight(self, engine_url: str) -> None:
+        """Notify that one request to ``engine_url`` finished (decrement in-flight)."""
+        dq = self._inflight.get(engine_url)
         if dq:
             dq.popleft()
 
     def _pending_load(self, url: str, now: float) -> int:
-        """In-flight request count for ``url`` (completion-accurate, TTL-capped)."""
+        """
+        In-flight request count for ``url`` (completion-accurate, TTL-capped).
+
+        Side effect: lazily evicts entries older than the inflight_decay safety
+        cap (dispatches whose completion was never observed).
+        """
         dq = self._inflight.get(url)
         if not dq:
             return 0
@@ -429,7 +448,10 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
 
         if session_id is None:
             # Production traffic always carries a session id; this defensive
-            # branch simply picks the least-loaded engine.
+            # branch deliberately picks the least-loaded engine (not SessionRouter's
+            # _qps_routing) because this router is overload- rather than qps-aware.
+            # No stickiness/fallback metric is recorded: those describe session
+            # routing only.
             chosen = min(
                 (e.url for e in endpoints),
                 key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot, now),
@@ -477,6 +499,15 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         if now is not None:
             self._evict(now)
         return self._win_total, self._win_fallback, dict(self._win_reason)
+
+    def refresh_window_metrics(self, now: float = None) -> None:
+        """
+        Evict expired events and republish the rate gauges. Called on /metrics
+        scrape so the rates keep decaying to zero when traffic stops, instead of
+        freezing at the last recorded value.
+        """
+        self._evict(time.time() if now is None else now)
+        self._publish_gauges()
 
     def _publish_gauges(self) -> None:
         total = self._win_total
@@ -751,16 +782,21 @@ def initialize_routing_logic(
         logger.info(
             f"Initializing cache-aware load balancing routing logic with kwargs: {kwargs}"
         )
+        # Pass only the keys that were supplied so the defaults live in exactly
+        # one place: the CacheAwareLoadBalancingRouter.__init__ signature.
+        optional = (
+            "tolerate_waiting_requests",
+            "p50_ttft_threshold",
+            "p99_ttft_threshold",
+            "p50_e2e_threshold",
+            "p99_e2e_threshold",
+            "stats_window",
+            "inflight_decay",
+            "tie_tolerance",
+        )
+        router_kwargs = {k: kwargs[k] for k in optional if k in kwargs}
         return CacheAwareLoadBalancingRouter(
-            session_key=kwargs.get("session_key"),
-            tolerate_waiting_requests=kwargs.get("tolerate_waiting_requests", 20),
-            p50_ttft_threshold=kwargs.get("p50_ttft_threshold", 0.0),
-            p99_ttft_threshold=kwargs.get("p99_ttft_threshold", 0.0),
-            p50_e2e_threshold=kwargs.get("p50_e2e_threshold", 0.0),
-            p99_e2e_threshold=kwargs.get("p99_e2e_threshold", 0.0),
-            stats_window=kwargs.get("stats_window", 30.0),
-            inflight_decay=kwargs.get("inflight_decay", 300.0),
-            tie_tolerance=kwargs.get("tie_tolerance", 0.0),
+            session_key=kwargs.get("session_key"), **router_kwargs
         )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")

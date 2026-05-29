@@ -300,3 +300,28 @@ C8 的跨副本缓解依赖 scraped running，**只能在一次 scrape 后收敛
 ### 说明
 - 单副本下随机化几乎不触发（local in-flight 计数会把候选区分开，很少精确并列），所以单副本行为基本不变；它主要在多副本盲窗的"大家都看起来一样空"时发挥作用。
 - 三层叠加最终形态：in-flight 计数（单副本即时）+ scraped running（跨副本，scrape 后收敛）+ 并列随机（跨副本盲窗内统计分散）。
+
+---
+
+## C10 — code review 收口（@review，两轴：Standards + Spec）
+
+对 `ba6c304..HEAD` 跑了 review skill（Standards / Spec 两个并行子代理）。逐条处理：
+
+### 修复（全改）
+- **[Spec#2 真 bug] 窗口率指标空闲卡住**：之前 `_publish_gauges` 只在 `_record` 里调，无新请求时 `stickiness/fallback` 率冻结在最后值。新增 `refresh_window_metrics(now)`（evict+publish），并在 `metrics_router.py` 的 `/metrics` handler 里对活跃的 cache-aware router 调用 → 空闲时随窗口衰减到 0。**实测**：traffic 后 0.875/0.125 → 空闲 12s(>窗口10s) 再抓 = 0.0/0.0。
+- **[Standards HARD1] 默认值三处重复**：工厂改为只透传"已提供的键"（`{k: kwargs[k] for k in optional if k in kwargs}`），默认值单一来源 = `__init__` 签名。
+- **[Standards HARD2] 完成钩子不在契约里 + 同名混淆**：在 `RoutingInterface` 加 no-op `release_inflight(engine_url)`，cache-aware 覆写；`request.py` 直接调 `router.release_inflight(...)`（不再 duck-typing），并与 `RequestStatsMonitor.on_request_complete` 区分命名。
+- **[Standards J3] `get_overload_snapshot` 返回内部缓存引用**：改为返回深拷贝（`{u: dict(v)}`，N×4 floats，开销可忽略）。
+- **[Standards J4] 无锁假设**：类 docstring 注明状态仅在 asyncio 事件循环线程被修改，故不加锁。
+- **[Standards J5] 无 session 分支**：注明刻意用 least-load（非 `_qps_routing`），且不计入会话指标。
+- **[Standards J6] `_pending_load` 读取有副作用**：docstring 注明惰性淘汰过期项。
+
+### 不改（已确认合理）
+- Spec(b) `request.py` 加 hook：修复 #1 必需，未动解包逻辑，合理偏离。
+- Spec(c1) fallback 主键 `queue+running+pending`：修复 #2/#3 的有意结果，非 #7 字面。
+- Spec(c3) 无 session 不计指标：刻意语义（已注明）。
+- fake server 的 `POST /set_metrics`：测试设想，非需求，未做。
+
+### 验证
+- 全量 `pytest src/tests/ --ignore=test-openai.py` → **75 passed**（新增 idle-decay、base no-op release_inflight 测试）；black/isort/ruff/codespell 全过。
+- 镜像 `:c10`：空闲衰减实测通过（见上）。

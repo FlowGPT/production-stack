@@ -218,6 +218,28 @@ def test_window_rate_gauges():
     )
 
 
+def test_refresh_window_metrics_decays_when_idle():
+    # Rates must decay toward zero when no new requests arrive, not freeze.
+    r = _fresh_router(stats_window=30.0)
+    r._record(1000.0, True, ["queue"])
+    r._record(1001.0, False, [])
+    assert cache_aware_fallback_rate._value.get() == 0.5
+    # long after the window, a scrape-time refresh should show no activity
+    r.refresh_window_metrics(now=1000.0 + 100.0)
+    assert cache_aware_fallback_rate._value.get() == 0.0
+    assert cache_aware_stickiness_rate._value.get() == 0.0
+    assert cache_aware_fallback_reason_rate.labels(reason="queue")._value.get() == 0.0
+
+
+def test_base_router_release_inflight_is_noop():
+    from vllm_router.routers.routing_logic import RoundRobinRouter
+
+    SingletonABCMeta._instances.pop(RoundRobinRouter, None)
+    rr = RoundRobinRouter()
+    # default contract method exists and does nothing / does not raise
+    assert rr.release_inflight("http://whatever") is None
+
+
 def test_route_with_snapshot_records_decisions():
     r = _fresh_router(tolerate_waiting_requests=5)
     eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
@@ -286,12 +308,12 @@ def test_completion_decrements_inflight():
     r._record_dispatch(1000.0, "http://e2")
     r._record_dispatch(1000.0, "http://e2")
     assert r._pending_load("http://e2", 1000.0) == 2
-    r.on_request_complete("http://e2")
+    r.release_inflight("http://e2")
     assert r._pending_load("http://e2", 1000.0) == 1
-    r.on_request_complete("http://e2")
+    r.release_inflight("http://e2")
     assert r._pending_load("http://e2", 1000.0) == 0
     # extra completion is harmless
-    r.on_request_complete("http://e2")
+    r.release_inflight("http://e2")
     assert r._pending_load("http://e2", 1000.0) == 0
 
 
@@ -375,7 +397,7 @@ def test_long_inflight_not_forgotten_until_complete():
     # 100s later (longer than the old 5s decay) it is still in flight
     assert r._pending_load("http://e2", 1100.0) == 1
     # only an actual completion clears it
-    r.on_request_complete("http://e2")
+    r.release_inflight("http://e2")
     assert r._pending_load("http://e2", 1100.0) == 0
 
 

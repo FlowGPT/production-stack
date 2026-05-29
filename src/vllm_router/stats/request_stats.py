@@ -343,7 +343,8 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             self._overload_cache
             and now - self._overload_cache_ts < self._overload_refresh_interval
         ):
-            return self._overload_cache
+            # Return a copy so callers cannot mutate the cached snapshot.
+            return {url: dict(vals) for url, vals in self._overload_cache.items()}
 
         snapshot: Dict[str, Dict[str, float]] = {}
         urls = set(self.ttft_monitors.keys()).union(set(self.latency_monitors.keys()))
@@ -363,7 +364,7 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
 
         self._overload_cache = snapshot
         self._overload_cache_ts = now
-        return snapshot
+        return {url: dict(vals) for url, vals in snapshot.items()}
 
 
 def initialize_request_stats_monitor(sliding_window_size: float):
