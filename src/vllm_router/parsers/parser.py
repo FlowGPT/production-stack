@@ -222,6 +222,15 @@ def parse_args():
         "stickiness / fallback rate metrics. Default 30.",
     )
     parser.add_argument(
+        "--cache-aware-inflight-decay",
+        type=float,
+        default=5.0,
+        help="cache_aware_load_balancing: seconds a just-dispatched request is "
+        "counted as in-flight when ranking fallback targets. Lets concurrent "
+        "fallbacks spread instead of herding onto one engine while the engine "
+        "stats scrape is stale. Set near the typical request duration. Default 5.",
+    )
+    parser.add_argument(
         "--lmcache-controller-port",
         type=int,
         default=9000,

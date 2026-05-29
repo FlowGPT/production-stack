@@ -55,7 +55,7 @@ def test_select_fallback_excludes_overloaded_picks_min_queue():
     r = _fresh_router(tolerate_waiting_requests=5)
     eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
     es = _stats({"http://e1": 10, "http://e2": 2, "http://e3": 1})
-    chosen = r._select_fallback("http://e1", eps, es, {})
+    chosen = r._select_fallback("http://e1", eps, es, {}, now=1000.0)
     assert chosen == "http://e3"  # lowest queue among non-overloaded
 
 
@@ -67,7 +67,7 @@ def test_select_fallback_tie_break_by_p50_e2e():
         "http://e2": {"p50_e2e": 9.0, "p99_e2e": 9, "p50_ttft": 1, "p99_ttft": 1},
         "http://e3": {"p50_e2e": 3.0, "p99_e2e": 3, "p50_ttft": 1, "p99_ttft": 1},
     }
-    chosen = r._select_fallback("http://e1", eps, es, snap)
+    chosen = r._select_fallback("http://e1", eps, es, snap, now=1000.0)
     assert chosen == "http://e3"  # same queue=2, smaller p50_e2e wins
 
 
@@ -75,7 +75,7 @@ def test_select_fallback_all_overloaded_returns_initial():
     r = _fresh_router(tolerate_waiting_requests=5)
     eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2")]
     es = _stats({"http://e1": 8, "http://e2": 9})
-    assert r._select_fallback("http://e1", eps, es, {}) == "http://e1"
+    assert r._select_fallback("http://e1", eps, es, {}, now=1000.0) == "http://e1"
 
 
 def test_route_request_sticky_when_under_threshold():
@@ -242,3 +242,54 @@ def test_route_with_snapshot_records_decisions():
     total, fallback, reasons = r.get_window_stats()
     assert total == 2 and fallback == 1
     assert reasons["queue"] == 1
+
+
+# --- C6: in-flight accounting prevents the fallback thundering herd ---
+
+
+def test_fallback_no_recent_dispatch_is_deterministic():
+    # With no recorded dispatches, behavior matches the plain (queue, p50_e2e)
+    # ranking: lowest stale queue wins.
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e2", "http://e3")]
+    es = _stats({"http://e2": 0, "http://e3": 0})
+    assert r._select_fallback("http://e1", eps, es, {}, now=1000.0) == "http://e2"
+
+
+def test_inflight_accounting_spreads_repeated_fallback():
+    # Two idle candidates with identical stale queue=0. Repeated fallback
+    # decisions must spread once recent dispatches are accounted for, instead
+    # of all piling onto the first candidate (the thundering herd).
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e2", "http://e3")]
+    es = _stats({"http://e2": 0, "http://e3": 0})
+    now = 1000.0
+    picks = []
+    for _ in range(10):
+        url = r._select_fallback("http://e1", eps, es, {}, now=now)
+        r._record_dispatch(now, url)
+        picks.append(url)
+    assert picks.count("http://e2") >= 4
+    assert picks.count("http://e3") >= 4
+
+
+def test_inflight_decay_clears_pending():
+    r = _fresh_router(tolerate_waiting_requests=5, inflight_decay=5.0)
+    r._record_dispatch(1000.0, "http://e2")
+    r._record_dispatch(1000.0, "http://e2")
+    assert r._pending_load("http://e2", 1000.0) == 2
+    # past the decay window the pending load is forgotten
+    assert r._pending_load("http://e2", 1000.0 + 5.01) == 0
+
+
+def test_route_records_dispatch_for_chosen_engine():
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    req = FakeRequest({"session_id": "abc"})
+    r._update_hash_ring(eps)
+    initial = r.hash_ring.get_node("abc")
+    es = _stats({u: 0 for u in ("http://e1", "http://e2", "http://e3")})
+    now = 1000.0
+    chosen = r._route_with_snapshot(eps, es, req, {}, now=now)
+    assert r._pending_load(chosen, now) == 1
+    assert chosen == initial  # under threshold -> sticky, still recorded

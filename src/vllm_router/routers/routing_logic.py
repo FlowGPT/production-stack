@@ -244,6 +244,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         p50_e2e_threshold: float = 0.0,
         p99_e2e_threshold: float = 0.0,
         stats_window: float = 30.0,
+        inflight_decay: float = 5.0,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -271,7 +272,35 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         self._win_total = 0
         self._win_fallback = 0
         self._win_reason: Counter = Counter()
+
+        # Recently dispatched targets, decayed over inflight_decay seconds. The
+        # scraped engine queue is up to --engine-stats-interval stale, so during
+        # a burst every fallback would otherwise pick the same lowest-queue
+        # engine (thundering herd). Counting requests this router just sent makes
+        # concurrent fallbacks see each other and self-disperse.
+        self.inflight_decay = inflight_decay
+        self._dispatch_log: Deque[Tuple[float, str]] = deque()
+        self._pending: Counter = Counter()
         self._initialized = True
+
+    def _evict_dispatches(self, now: float) -> None:
+        cutoff = now - self.inflight_decay
+        while self._dispatch_log and self._dispatch_log[0][0] < cutoff:
+            _, url = self._dispatch_log.popleft()
+            self._pending[url] -= 1
+            if self._pending[url] <= 0:
+                del self._pending[url]
+
+    def _record_dispatch(self, now: float, url: str) -> None:
+        """Remember a request just routed to ``url`` (decayed in-flight load)."""
+        self._dispatch_log.append((now, url))
+        self._pending[url] += 1
+        self._evict_dispatches(now)
+
+    def _pending_load(self, url: str, now: float) -> int:
+        """Number of recent dispatches to ``url`` still within the decay window."""
+        self._evict_dispatches(now)
+        return self._pending.get(url, 0)
 
     def _overload_snapshot(self) -> Dict[str, Dict[str, float]]:
         """Latency percentiles per engine; empty if the monitor is unavailable."""
@@ -309,13 +338,17 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         url: str,
         engine_stats: Dict[str, EngineStats],
         snapshot: Dict[str, Dict[str, float]],
+        now: float,
     ):
         stats = engine_stats.get(url)
         queue = stats.num_queuing_requests if stats is not None else 0
+        # Add requests this router recently sent but the scrape has not yet seen,
+        # so concurrent fallbacks spread instead of herding onto one engine.
+        effective_queue = queue + self._pending.get(url, 0)
         p50_e2e = snapshot.get(url, {}).get("p50_e2e", -1)
         # Unknown latency (-1) is deprioritised in the tie-break.
         p50_e2e = p50_e2e if p50_e2e >= 0 else float("inf")
-        return (queue, p50_e2e)
+        return (effective_queue, p50_e2e)
 
     def _select_fallback(
         self,
@@ -323,7 +356,9 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         endpoints: List[EndpointInfo],
         engine_stats: Dict[str, EngineStats],
         snapshot: Dict[str, Dict[str, float]],
+        now: float,
     ) -> str:
+        self._evict_dispatches(now)
         candidates = [
             e.url
             for e in endpoints
@@ -334,7 +369,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             return initial_url
         return min(
             candidates,
-            key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot),
+            key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot, now),
         )
 
     def route_request(
@@ -358,25 +393,35 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         engine_stats: Dict[str, EngineStats],
         request: Request,
         snapshot: Dict[str, Dict[str, float]],
+        now: float = None,
     ) -> str:
+        if now is None:
+            now = time.time()
         self._update_hash_ring(endpoints)
         session_id = request.headers.get(self.session_key, None)
 
         if session_id is None:
             # Production traffic always carries a session id; this defensive
             # branch simply picks the least-loaded engine.
-            return min(
+            chosen = min(
                 (e.url for e in endpoints),
-                key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot),
+                key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot, now),
             )
+            self._record_dispatch(now, chosen)
+            return chosen
 
         initial_url = self.hash_ring.get_node(session_id)
         reasons = self._violated_reasons(initial_url, engine_stats, snapshot)
         if not reasons:
-            self._record(time.time(), False, [])
+            self._record(now, False, [])
+            self._record_dispatch(now, initial_url)
             return initial_url
-        self._record(time.time(), True, reasons)
-        return self._select_fallback(initial_url, endpoints, engine_stats, snapshot)
+        self._record(now, True, reasons)
+        chosen = self._select_fallback(
+            initial_url, endpoints, engine_stats, snapshot, now
+        )
+        self._record_dispatch(now, chosen)
+        return chosen
 
     def _evict(self, now: float) -> None:
         cutoff = now - self.stats_window
@@ -687,6 +732,7 @@ def initialize_routing_logic(
             p50_e2e_threshold=kwargs.get("p50_e2e_threshold", 0.0),
             p99_e2e_threshold=kwargs.get("p99_e2e_threshold", 0.0),
             stats_window=kwargs.get("stats_window", 30.0),
+            inflight_decay=kwargs.get("inflight_decay", 5.0),
         )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")

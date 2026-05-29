@@ -189,3 +189,40 @@
 
 ### 磁盘
 - 验证期间磁盘 95%（剩 23G），复用已有镜像、未新建大镜像；可回收项为 build cache(~56G) 与冗余 c1–c4 镜像（未清，待确认）。测试容器与 mock 已于验证后全部停止，GPU 归还。
+
+---
+
+## C6 — 修复 fallback 惊群（thundering herd）
+
+### 背景 / 诊断（线上超限根因）
+线上 router 镜像 `ssadds/production-stack:vllm`（`0fa8661`）出现"大量请求同时 fallback 到同一 pod 导致超限"。按 diagnose 流程复现 + 定位：
+
+复现（mock：4 个 hot 引擎 base_waiting=99 强制 fallback + 2 个 idle 候选 capacity=4 delay=3；router 默认 30s scrape；40 个不同 session 并发）：
+- C5（修复前）：26 个 fallback **全部** 打到 candA → candA 峰值并发 **35**，candB **5**（≈7:1）。
+
+根因（三条，前两条与线上镜像共有）：
+1. **engine_stats 30s scrape 陈旧**：一个 burst 全程看到候选 `queue=0` 的旧值。
+2. **router 无在途(in-flight)计账**：从不计入自己刚派发、scrape 还没看到的请求。
+3. **确定性 `min(queue,p50_e2e)`**：陈旧窗口内所有 fallback 收敛到同一个最低队列引擎（线上是 `random.choice` 略好，但 idle 候选少 + 30s 盲窗，每个仍远超 tolerate → 一样超限）。
+
+### 改了什么（修第 2 条，最小且对症）
+- `src/vllm_router/routers/routing_logic.py`：router 维护"最近派发"衰减计数 `_dispatch_log/_pending`，`_record_dispatch`/`_evict_dispatches`/`_pending_load`；`_fallback_sort_key` 用 `effective_queue = scraped_queue + pending` 排序；`route_request` 在**同步**决策点（无 await，事件循环内原子）记录派发，使并发 fallback 互相可见、自动打散。`_select_fallback`/`_route_with_snapshot` 透传 `now`（可测）。
+- `--cache-aware-inflight-decay`（默认 5s，近似单请求时长）+ app 接线 + 工厂。
+- `_violated_reasons`（粘滞阈值判定）保持不变，仅 fallback 目标选择受影响 → 不改用户既定语义。
+- 性能：deque + Counter O(1) 摊销，热路径无排序。
+
+### 怎么测
+- TDD 回归（先红）：`test_inflight_accounting_spreads_repeated_fallback`、`test_inflight_decay_clears_pending`、`test_route_records_dispatch_for_chosen_engine`、`test_fallback_no_recent_dispatch_is_deterministic`（无派发时退化为原确定性行为）；旧 `_select_fallback` 测试补 `now`。
+- 全量：`pytest src/tests/ --ignore=test-openai.py` → **66 passed**；black/isort/ruff/codespell 全过。
+- 镜像复测（`vllm-router-cacheaware:c6`，同一 40 并发 burst，decay=5）：candA 峰值 **21**、candB **19**（≈1.1:1）→ 惊群被打散；`/metrics` 率指标仍正常。
+
+### 对比
+| | candA 峰值并发 | candB 峰值并发 |
+|---|---|---|
+| C5 修复前 | 35 | 5 |
+| C6 修复后 | 21 | 19 |
+
+### 引以为戒（post-mortem）
+- 任何"基于周期 scrape 的负载做路由决策"都必须叠加 **router 自身在途计数**，否则 scrape 盲窗内必然惊群；随机分发只是缓解，不解决。
+- 衰减窗口应贴近真实请求时长；过短退化为无计账，过长会过度分散（可经 `--cache-aware-inflight-decay` 调）。
+- 进一步可选项（未做，避免 over-engineering）：缩短 `--engine-stats-interval`、按精确完成回调而非时间衰减。
