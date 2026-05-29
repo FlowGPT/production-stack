@@ -190,6 +190,7 @@ def initialize_all(app: FastAPI, args):
         p99_e2e_threshold=args.cache_aware_p99_e2e_threshold,
         stats_window=args.cache_aware_stats_window,
         inflight_decay=args.cache_aware_inflight_decay,
+        tie_tolerance=args.cache_aware_tie_tolerance,
         lmcache_controller_port=args.lmcache_controller_port,
         prefill_model_labels=args.prefill_model_labels,
         decode_model_labels=args.decode_model_labels,

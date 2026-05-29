@@ -245,6 +245,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         p99_e2e_threshold: float = 0.0,
         stats_window: float = 30.0,
         inflight_decay: float = 300.0,
+        tie_tolerance: float = 0.0,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -254,6 +255,9 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             )
         self.session_key = session_key
         self.tolerate_waiting_requests = tolerate_waiting_requests
+        # Engines within this load gap of the best are treated as tied and the
+        # choice among them is randomised (breaks cross-replica herding).
+        self.tie_tolerance = tie_tolerance
         # Latency percentile thresholds in seconds; <= 0 disables that check.
         # (snapshot_key, threshold) pairs evaluated in _violated_reasons.
         self.latency_thresholds = {
@@ -374,10 +378,26 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         if not candidates:
             # Every engine is overloaded: keep KV cache affinity.
             return initial_url
-        return min(
-            candidates,
-            key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot, now),
-        )
+
+        keys = {
+            u: self._fallback_sort_key(u, engine_stats, snapshot, now)
+            for u in candidates
+        }
+        min_load = min(k[0] for k in keys.values())
+        # Engines whose load is within tie_tolerance of the best are "equally
+        # good"; a clear winner is still chosen deterministically.
+        load_tied = [
+            u for u in candidates if keys[u][0] <= min_load + self.tie_tolerance
+        ]
+        if len(load_tied) == 1:
+            return load_tied[0]
+        # Among load-tied engines prefer lower p50 e2e, then randomise the
+        # remaining exact ties. Randomising genuine ties breaks the cross-replica
+        # thundering herd -- independent replicas with identical stale views pick
+        # different engines -- without any shared state.
+        min_p50 = min(keys[u][1] for u in load_tied)
+        best = [u for u in load_tied if keys[u][1] <= min_p50 + 1e-6]
+        return random.choice(best) if len(best) > 1 else best[0]
 
     def route_request(
         self,
@@ -739,7 +759,8 @@ def initialize_routing_logic(
             p50_e2e_threshold=kwargs.get("p50_e2e_threshold", 0.0),
             p99_e2e_threshold=kwargs.get("p99_e2e_threshold", 0.0),
             stats_window=kwargs.get("stats_window", 30.0),
-            inflight_decay=kwargs.get("inflight_decay", 5.0),
+            inflight_decay=kwargs.get("inflight_decay", 300.0),
+            tie_tolerance=kwargs.get("tie_tolerance", 0.0),
         )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")

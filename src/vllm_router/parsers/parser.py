@@ -232,6 +232,16 @@ def parse_args():
         "expected request. Default 300.",
     )
     parser.add_argument(
+        "--cache-aware-tie-tolerance",
+        type=float,
+        default=0.0,
+        help="cache_aware_load_balancing: engines whose effective load is within "
+        "this gap of the best are treated as tied and chosen at random. Breaks "
+        "cross-replica fallback herding (independent router replicas with the "
+        "same stale view pick different engines) without shared state. Default 0 "
+        "(randomise only exact ties).",
+    )
+    parser.add_argument(
         "--lmcache-controller-port",
         type=int,
         default=9000,

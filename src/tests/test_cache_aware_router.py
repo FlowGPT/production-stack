@@ -247,12 +247,11 @@ def test_route_with_snapshot_records_decisions():
 # --- C6: in-flight accounting prevents the fallback thundering herd ---
 
 
-def test_fallback_no_recent_dispatch_is_deterministic():
-    # With no recorded dispatches, behavior matches the plain (queue, p50_e2e)
-    # ranking: lowest stale queue wins.
+def test_fallback_no_recent_dispatch_clear_winner():
+    # With a clear lowest-load candidate the choice is deterministic.
     r = _fresh_router(tolerate_waiting_requests=5)
     eps = [FakeEndpoint(u) for u in ("http://e2", "http://e3")]
-    es = _stats({"http://e2": 0, "http://e3": 0})
+    es = _stats({"http://e2": 0, "http://e3": 2})
     assert r._select_fallback("http://e1", eps, es, {}, now=1000.0) == "http://e2"
 
 
@@ -294,6 +293,65 @@ def test_completion_decrements_inflight():
     # extra completion is harmless
     r.on_request_complete("http://e2")
     assert r._pending_load("http://e2", 1000.0) == 0
+
+
+def test_select_fallback_clear_winner_is_deterministic():
+    # A clear load winner is always chosen (no randomness) across many calls.
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    es = _stats({"http://e1": 10, "http://e2": 0, "http://e3": 3})
+    picks = {
+        r._select_fallback("http://e1", eps, es, {}, now=1000.0) for _ in range(50)
+    }
+    assert picks == {"http://e2"}
+
+
+def test_select_fallback_randomises_genuine_ties():
+    # Two idle candidates, identical load and no latency data: independent
+    # decisions (e.g. separate router replicas) must NOT all pick the same one.
+    import random as _random
+
+    _random.seed(0)
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    es = _stats({"http://e1": 10, "http://e2": 0, "http://e3": 0})
+    # NOTE: no _record_dispatch between calls -> simulates independent replicas
+    # each seeing the same empty/stale view.
+    picks = [
+        r._select_fallback("http://e1", eps, es, {}, now=1000.0) for _ in range(200)
+    ]
+    assert set(picks) == {"http://e2", "http://e3"}
+    # roughly balanced
+    assert 60 < picks.count("http://e2") < 140
+
+
+def test_tie_break_p50_still_deterministic_within_load_tie():
+    # Load-tied but latency differs -> still deterministic by p50 (no randomness).
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    es = _stats({"http://e1": 10, "http://e2": 0, "http://e3": 0})
+    snap = {
+        "http://e2": {"p50_e2e": 9.0, "p99_e2e": 9, "p50_ttft": 1, "p99_ttft": 1},
+        "http://e3": {"p50_e2e": 3.0, "p99_e2e": 3, "p50_ttft": 1, "p99_ttft": 1},
+    }
+    picks = {
+        r._select_fallback("http://e1", eps, es, snap, now=1000.0) for _ in range(50)
+    }
+    assert picks == {"http://e3"}
+
+
+def test_tie_tolerance_groups_near_equal_loads():
+    # With tolerance >= 1, loads 0 and 1 are treated as tied and randomised.
+    import random as _random
+
+    _random.seed(1)
+    r = _fresh_router(tolerate_waiting_requests=100, tie_tolerance=1.0)
+    eps = [FakeEndpoint(u) for u in ("http://e2", "http://e3")]
+    es = _stats({"http://e2": 0, "http://e3": 1})
+    picks = [
+        r._select_fallback("http://e1", eps, es, {}, now=1000.0) for _ in range(200)
+    ]
+    assert set(picks) == {"http://e2", "http://e3"}
 
 
 def test_fallback_prefers_lower_scraped_running():

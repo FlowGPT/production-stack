@@ -276,3 +276,27 @@ C6 的在途计数 `_pending` 按 `--cache-aware-inflight-decay`(5s) **时间衰
 ### 残留限制（诚实记录，未做 = 避免 over-engineering）
 - 跨副本只在**一次 scrape 之后**收敛；**同一 scrape 间隔内多副本同时突发**仍会部分惊群（13/7 中那 3 个即来自 scrape 滞后）。要更强需共享状态（如 Redis）或把 scrape 间隔调小。
 - 实操建议：多副本部署务必调小 `--engine-stats-interval`（3–5s）；单副本部署不受 #2 影响。
+
+---
+
+## C9 — 随机化打散并列（彻底缓解 #2 残留，无需 Redis）
+
+### 背景
+C8 的跨副本缓解依赖 scraped running，**只能在一次 scrape 后收敛**；同一 scrape 盲窗内多副本同时突发仍会齐刷刷按确定性 `min` 扑同一引擎。根因是**确定性**：所有副本用同一份陈旧视图算出同一个 min。
+
+### 修复（方案 2：只在"近似并列"时随机）
+- `_select_fallback`：候选按有效负载分组，落在 `min_load + tie_tolerance` 内的视为"并列"；
+  - 有明确赢家（仅 1 个）→ **确定性**返回；
+  - 并列多个 → 先按 p50_e2e 取最优，**仅对仍并列者随机**（`random.choice`）。
+- 新增 `--cache-aware-tie-tolerance`（默认 0.0 = 只随机精确并列）+ app/工厂接线。
+- 不引入任何共享状态/Redis；确定性在"有明确赢家"时完全保留（你之前选的 `(queue,p50_e2e)` 语义在非并列时不变）。
+
+### 证明 + 回归
+- 单元（严格证明跨副本分散）：`test_select_fallback_randomises_genuine_ties` —— 对**同一空/陈旧视图**做 200 次独立决策（等价于 200 个独立副本同刻决策），确定性会全选同一个，随机化后**两引擎都出现且大致均衡**（实测 ~60–140/200）。
+- 其余新增：明确赢家恒定（`clear_winner_is_deterministic`）、load 并列但 p50 不同仍确定（`tie_break_p50_still_deterministic`）、`tie_tolerance` 分组（`tie_tolerance_groups_near_equal_loads`）。
+- 全量 `pytest src/tests/ --ignore=test-openai.py` → **73 passed**，连跑 3 次无 flaky；black/isort/ruff/codespell 全过。
+- 镜像 `:c9` 回归：#1=14/10、#2=13/7（均与修复后一致，未回归）；正常粘滞 ×8 全落单引擎、单波 40 并发 20/20。
+
+### 说明
+- 单副本下随机化几乎不触发（local in-flight 计数会把候选区分开，很少精确并列），所以单副本行为基本不变；它主要在多副本盲窗的"大家都看起来一样空"时发挥作用。
+- 三层叠加最终形态：in-flight 计数（单副本即时）+ scraped running（跨副本，scrape 后收敛）+ 并列随机（跨副本盲窗内统计分散）。
