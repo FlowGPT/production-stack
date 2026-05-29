@@ -163,4 +163,29 @@
 
 性能：分位数 TTL(1s) 缓存隔离热路径；指标 O(1) 摊销；未改其他 router/代理路径。
 
-提交（sss-dev）：C0 `22c83cc` · C1 `7a5294b` · C2 `830afb4` · C3 `182773f` · C4 `fadcdc5` · C5 见下。
+提交（sss-dev）：C0 `22c83cc` · C1 `7a5294b` · C2 `830afb4` · C3 `182773f` · C4 `fadcdc5` · C5 `3ea4b49` · worklog `51f9a67`。
+
+---
+
+## 补充验证（全量，应要求"都跑"）
+
+镜像 `vllm-router-cacheaware:c5`，stdlib mock 后端，`--network host`。
+
+### 容器集成补全（之前只单测的分支）
+- 场景 A（四个延迟阈值全开，e2 慢 2s，tolerate=1000）：req1 粘 e2，其后全 fallback e1；`/metrics` `stickiness=0.125 fallback=0.875`，`reason{p50_ttft,p99_ttft,p50_e2e,p99_e2e}=0.875`、`queue=0` → 四个延迟阈值与归因全部 PASS。
+- 场景 B（全员 waiting=99，tolerate=5）：session 全部停留在原 sticky 引擎 e2（5 命中）；`fallback_rate=1.0 reason{queue}=1.0 stickiness=0` → 全员超限退回原 engine PASS。
+- 场景 C（e1=0/e2=99/e3=5，无 session header）：5 次全部命中 e1（最小 queue）→ 无 session 最小负载 PASS。
+
+### 全量单测
+- `PYTHONPATH=src pytest src/tests/ --ignore=test-openai.py`（pytest-asyncio 固定 CI 版 0.25.3）→ **62 passed**（含 test_file_storage 异步用例；之前 5 个 error 是我临时装的 pytest-asyncio 版本不匹配所致，与本改动无关）。
+
+### 真实 vLLM 端到端
+- 真实引擎：`ssadds/vllm:260528-patch` serve `wangqia0309/Captain-Eris_Violet-V0.420-12B-FP8-KV-modelopt-fp4-chat`（`--quantization modelopt --kv-cache-dtype fp8 --enforce-eager`，:8000，~80s ready）+ 2 个 mock（:9101/:9103，同 model id）。
+- 路由 cache_aware，3 后端静态发现。发 6 个不同 session：
+  - 命中真实 vLLM 的 session（s1/s3/s5）返回**真实模型生成 token**（"Hi there!"/"Let's talk"），经 router 代理；
+  - 其余命中 mock；`stickiness_rate=1.0`（无超限全粘）。
+  - router 成功抓取真实 vLLM `/metrics`（`vllm:num_requests_running` 来自真实引擎）。
+- 结论：router 对**真实 vLLM 后端**的代理 + /metrics 抓取 + 粘滞路由 PASS。queue/延迟/指标判定与后端类型无关，已由 mock 全场景覆盖。
+
+### 磁盘
+- 验证期间磁盘 95%（剩 23G），复用已有镜像、未新建大镜像；可回收项为 build cache(~56G) 与冗余 c1–c4 镜像（未清，待确认）。测试容器与 mock 已于验证后全部停止，GPU 归还。
