@@ -121,6 +121,45 @@
 - 镜像集成：`vllm-router-cacheaware:c4`，跑流量后 `curl router:8001/metrics | grep cache_aware` 校验窗口率随 sticky/fallback 变化。
 
 ### 结果
-- 待回填（镜像 /metrics 抓取）。
+- 单测：40 passed；lint 全过；commit `fadcdc5`（clean）。
+- 镜像集成（`vllm-router-cacheaware:c4`，e2 `waiting=99` 超限，tolerate=5，15 个不同 session）：
+  - 后端命中 e1=9 e3=6 e2=0（凡 hash 到 e2 的 session 全部 fallback）。
+  - `curl router:8001/metrics`：`cache_aware_stickiness_rate=0.667`、`cache_aware_fallback_rate=0.333`、`cache_aware_fallback_reason_rate{reason="queue"}=0.333`，其余 reason=0；10 sticky + 5 fallback = 15 一致，PASS。
 
 ---
+
+## C5 — simplify + 全量验证收尾
+
+### 改了什么
+- `src/vllm_router/routers/routing_logic.py`：`_violated_reasons` 内 `if threshold and threshold > 0` 简化为 `if threshold > 0`，并合并冗余的 `value >= 0` 判定（-1 必低于任何正阈值），行为不变、更易读。
+- 本 worklog 收尾。
+
+### 怎么测（全量证据）
+- 单测全量（venv 可跑）：`pytest test_cache_aware_router test_overload_stats test_parser test_session_router test_singleton test_utils -q` → 51 passed。
+- lint 全量：black/isort/ruff/codespell 对全部改动文件通过。
+- 镜像：`vllm-router-cacheaware:c5` 构建 + 导入冒烟。
+
+### 结果
+- 见提交后回填。
+
+### 备注（真实 vLLM）
+- 路由改动不触碰代理/抓取路径（仅路由决策 + 指标），已用 stdlib mock 覆盖全部 queue/延迟/指标场景。
+- 未启真实 vLLM 端到端：本地无 `vllm-openai` 镜像、HF 缓存仅 12B–26B 量化大模型、磁盘 93%（剩 29G），按"低磁盘先确认"规则未做重型拉取/清理。可按需补做。
+
+---
+
+## 功能总览（最终）
+
+启用：`--routing-logic cache_aware_load_balancing --session-key <header>`，配合可选阈值：
+- `--cache-aware-tolerate-waiting-requests`（默认 20，排队阈值）
+- `--cache-aware-p50-ttft-threshold` / `--cache-aware-p99-ttft-threshold`（秒，0=关）
+- `--cache-aware-p50-e2e-threshold` / `--cache-aware-p99-e2e-threshold`（秒，0=关）
+- `--cache-aware-stats-window`（默认 30s，指标窗口）
+
+行为：session 粘滞 hash-ring engine；命中任一阈值 → fallback，候选=满足全部阈值的 engine，按 `(queue 升序, p50_e2e 升序)` 选；全员超限退回原 engine。
+
+指标（`/metrics`，≥30s 窗口）：`vllm:cache_aware_stickiness_rate`、`vllm:cache_aware_fallback_rate`、`vllm:cache_aware_fallback_reason_rate{reason=queue|p50_ttft|p99_ttft|p50_e2e|p99_e2e}`。
+
+性能：分位数 TTL(1s) 缓存隔离热路径；指标 O(1) 摊销；未改其他 router/代理路径。
+
+提交（sss-dev）：C0 `22c83cc` · C1 `7a5294b` · C2 `830afb4` · C3 `182773f` · C4 `fadcdc5` · C5 见下。

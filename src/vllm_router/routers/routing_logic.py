@@ -297,10 +297,10 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             reasons.append("queue")
         engine_snapshot = snapshot.get(url, {})
         for key, threshold in self.latency_thresholds.items():
-            if threshold and threshold > 0:
-                value = engine_snapshot.get(key, -1)
-                # value < 0 means "no completed requests yet" -> not a breach.
-                if value >= 0 and value >= threshold:
+            if threshold > 0:
+                # A snapshot value of -1 (no completed requests) is below any
+                # positive threshold, so it never trips a fallback.
+                if engine_snapshot.get(key, -1) >= threshold:
                     reasons.append(key)
         return reasons
 
