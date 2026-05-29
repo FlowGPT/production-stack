@@ -45,3 +45,18 @@ avg_itl = Gauge("vllm:avg_itl", "Average Inter-Token Latency", ["server"])
 num_requests_swapped = Gauge(
     "vllm:num_requests_swapped", "Number of swapped requests", ["server"]
 )
+
+# Cache-aware load balancing routing metrics (sliding window probabilities).
+cache_aware_stickiness_rate = Gauge(
+    "vllm:cache_aware_stickiness_rate",
+    "Fraction of session requests routed to their sticky engine in the window",
+)
+cache_aware_fallback_rate = Gauge(
+    "vllm:cache_aware_fallback_rate",
+    "Fraction of session requests that fell back off the sticky engine in the window",
+)
+cache_aware_fallback_reason_rate = Gauge(
+    "vllm:cache_aware_fallback_reason_rate",
+    "Fraction of session requests that fell back due to each threshold in the window",
+    ["reason"],
+)

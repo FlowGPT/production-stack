@@ -19,7 +19,8 @@ import math
 import random
 import threading
 import time
-from typing import Dict, List
+from collections import Counter, deque
+from typing import Deque, Dict, List, Tuple
 
 from fastapi import Request
 
@@ -40,6 +41,11 @@ from uhashring import HashRing
 
 from vllm_router.log import init_logger
 from vllm_router.service_discovery import EndpointInfo
+from vllm_router.services.metrics_service import (
+    cache_aware_fallback_rate,
+    cache_aware_fallback_reason_rate,
+    cache_aware_stickiness_rate,
+)
 from vllm_router.stats.engine_stats import EngineStats
 from vllm_router.stats.request_stats import RequestStats, get_request_stats_monitor
 from vllm_router.utils import SingletonABCMeta
@@ -226,6 +232,9 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     added on top of the same ``_violated_reasons`` seam.
     """
 
+    # All threshold names that can trigger a fallback (queue + latency).
+    REASONS = ("queue", "p50_ttft", "p99_ttft", "p50_e2e", "p99_e2e")
+
     def __init__(
         self,
         session_key: str = None,
@@ -234,6 +243,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         p99_ttft_threshold: float = 0.0,
         p50_e2e_threshold: float = 0.0,
         p99_e2e_threshold: float = 0.0,
+        stats_window: float = 30.0,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -252,6 +262,15 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             "p99_e2e": p99_e2e_threshold,
         }
         self.hash_ring = HashRing()
+
+        # Sliding-window tally of routing decisions for stickiness / fallback
+        # rate metrics. Running counters are kept in sync with the deque so the
+        # request path stays O(1) amortized.
+        self.stats_window = stats_window
+        self._events: Deque[Tuple[float, bool, Tuple[str, ...]]] = deque()
+        self._win_total = 0
+        self._win_fallback = 0
+        self._win_reason: Counter = Counter()
         self._initialized = True
 
     def _overload_snapshot(self) -> Dict[str, Dict[str, float]]:
@@ -352,9 +371,56 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             )
 
         initial_url = self.hash_ring.get_node(session_id)
-        if not self._violated_reasons(initial_url, engine_stats, snapshot):
+        reasons = self._violated_reasons(initial_url, engine_stats, snapshot)
+        if not reasons:
+            self._record(time.time(), False, [])
             return initial_url
+        self._record(time.time(), True, reasons)
         return self._select_fallback(initial_url, endpoints, engine_stats, snapshot)
+
+    def _evict(self, now: float) -> None:
+        cutoff = now - self.stats_window
+        while self._events and self._events[0][0] < cutoff:
+            _, was_fallback, reasons = self._events.popleft()
+            self._win_total -= 1
+            if was_fallback:
+                self._win_fallback -= 1
+            for reason in reasons:
+                self._win_reason[reason] -= 1
+
+    def _record(self, now: float, is_fallback: bool, reasons: List[str]) -> None:
+        """Record one session routing decision and refresh the rate gauges."""
+        reasons = tuple(reasons)
+        self._events.append((now, is_fallback, reasons))
+        self._win_total += 1
+        if is_fallback:
+            self._win_fallback += 1
+        for reason in reasons:
+            self._win_reason[reason] += 1
+        self._evict(now)
+        self._publish_gauges()
+
+    def get_window_stats(self, now: float = None) -> Tuple[int, int, Dict[str, int]]:
+        """Return (total, fallback, reason_counts) within the current window."""
+        if now is not None:
+            self._evict(now)
+        return self._win_total, self._win_fallback, dict(self._win_reason)
+
+    def _publish_gauges(self) -> None:
+        total = self._win_total
+        if total > 0:
+            sticky = total - self._win_fallback
+            cache_aware_stickiness_rate.set(sticky / total)
+            cache_aware_fallback_rate.set(self._win_fallback / total)
+            for reason in self.REASONS:
+                cache_aware_fallback_reason_rate.labels(reason=reason).set(
+                    self._win_reason.get(reason, 0) / total
+                )
+        else:
+            cache_aware_stickiness_rate.set(0)
+            cache_aware_fallback_rate.set(0)
+            for reason in self.REASONS:
+                cache_aware_fallback_reason_rate.labels(reason=reason).set(0)
 
 
 class KvawareRouter(RoutingInterface):
@@ -620,6 +686,7 @@ def initialize_routing_logic(
             p99_ttft_threshold=kwargs.get("p99_ttft_threshold", 0.0),
             p50_e2e_threshold=kwargs.get("p50_e2e_threshold", 0.0),
             p99_e2e_threshold=kwargs.get("p99_e2e_threshold", 0.0),
+            stats_window=kwargs.get("stats_window", 30.0),
         )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")

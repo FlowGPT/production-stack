@@ -215,6 +215,13 @@ def parse_args():
         "end-to-end latency (seconds) reaches this value. <= 0 disables. Default 0.",
     )
     parser.add_argument(
+        "--cache-aware-stats-window",
+        type=float,
+        default=30.0,
+        help="cache_aware_load_balancing: sliding window (seconds) for the "
+        "stickiness / fallback rate metrics. Default 30.",
+    )
+    parser.add_argument(
         "--lmcache-controller-port",
         type=int,
         default=9000,

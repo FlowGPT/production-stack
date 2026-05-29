@@ -99,6 +99,28 @@
 - 镜像集成：`vllm-router-cacheaware:c3`，给 mock 加 `--delay` 让粘滞引擎产生真实 e2e 延迟，设 `--cache-aware-p50-e2e-threshold` 验证延迟触发 fallback。
 
 ### 结果
-- 待回填（镜像集成）。
+- 单测：37 passed；lint 全过；commit `182773f`（clean）。
+- 镜像集成（`vllm-router-cacheaware:c3`，`--cache-aware-p50-e2e-threshold 0.5`，tolerate=1000 排除 queue 干扰；e2 `--delay 2` 慢、e1/e3 快）：
+  - req1=2.04s 命中粘滞 e2（尚无延迟数据）；e2 记录 p50_e2e≈2s≥0.5。
+  - req2–6≈0.02s 全部回退到 e1；命中统计 e2=1、e1=5、e3=0 → 延迟阈值触发 fallback，PASS。
+
+---
+
+## C4 — ≥30s 窗口率 Prometheus 指标
+
+### 改了什么
+- `src/vllm_router/services/metrics_service/__init__.py`：新增 3 个 Gauge `vllm:cache_aware_stickiness_rate`、`vllm:cache_aware_fallback_rate`、`vllm:cache_aware_fallback_reason_rate{reason}`（reason ∈ queue/p50_ttft/p99_ttft/p50_e2e/p99_e2e）。
+- `src/vllm_router/routers/routing_logic.py`：router 维护事件 deque `(ts,is_fallback,reasons)` + 运行计数（`_win_total/_win_fallback/_win_reason`）；`_record`/`_evict`/`get_window_stats`/`_publish_gauges`，O(1) 摊销；`_route_with_snapshot` 在 sticky/fallback 决策后记录；新增 `stats_window`（默认 30）参数与 `REASONS` 常量。`metrics_router.py` 未改（Gauge 经 `generate_latest()` 自动暴露）。
+- `src/vllm_router/parsers/parser.py`：新增 `--cache-aware-stats-window`(默认 30)。
+- `src/vllm_router/app.py`：传 `stats_window`。
+- `src/tests/test_cache_aware_router.py`：新增 3 个单测（窗口计数+过期淘汰、率 Gauge 数值、`_route_with_snapshot` 决策计数）。
+
+### 怎么测
+- 单测：`pytest src/tests/...` → 40 passed。
+- lint：black/isort/ruff/codespell 全过。
+- 镜像集成：`vllm-router-cacheaware:c4`，跑流量后 `curl router:8001/metrics | grep cache_aware` 校验窗口率随 sticky/fallback 变化。
+
+### 结果
+- 待回填（镜像 /metrics 抓取）。
 
 ---

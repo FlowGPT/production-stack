@@ -1,6 +1,11 @@
 """Unit tests for CacheAwareLoadBalancingRouter (C2: queue threshold + fallback)."""
 
 from vllm_router.routers.routing_logic import CacheAwareLoadBalancingRouter
+from vllm_router.services.metrics_service import (
+    cache_aware_fallback_rate,
+    cache_aware_fallback_reason_rate,
+    cache_aware_stickiness_rate,
+)
 from vllm_router.stats.engine_stats import EngineStats
 from vllm_router.stats.request_stats import (
     RequestStatsMonitor,
@@ -168,3 +173,72 @@ def test_route_request_fallback_on_latency_threshold():
     snapshot = {initial: _snap(p99_e2e=50.0)}
     chosen = r._route_with_snapshot(eps, es, req, snapshot)
     assert chosen in others
+
+
+def test_window_counts_and_eviction():
+    r = _fresh_router(stats_window=30.0)
+    r._record(100.0, False, [])
+    r._record(101.0, True, ["queue"])
+    r._record(102.0, True, ["p50_e2e"])
+    total, fallback, reasons = r.get_window_stats()
+    assert total == 3
+    assert fallback == 2
+    assert reasons["queue"] == 1
+    assert reasons["p50_e2e"] == 1
+
+    # record well past the window -> earlier events evicted
+    r._record(140.0, False, [])
+    total, fallback, reasons = r.get_window_stats()
+    assert total == 1
+    assert fallback == 0
+    assert reasons["queue"] == 0
+
+
+def test_window_rate_gauges():
+    r = _fresh_router(stats_window=30.0)
+    r._record(200.0, False, [])
+    r._record(201.0, True, ["queue"])
+    r._record(202.0, True, ["queue", "p99_e2e"])
+    # 3 total, 2 fallback, queue=2, p99_e2e=1
+    assert abs(cache_aware_stickiness_rate._value.get() - (1 / 3)) < 1e-9
+    assert abs(cache_aware_fallback_rate._value.get() - (2 / 3)) < 1e-9
+    assert (
+        abs(
+            cache_aware_fallback_reason_rate.labels(reason="queue")._value.get()
+            - (2 / 3)
+        )
+        < 1e-9
+    )
+    assert (
+        abs(
+            cache_aware_fallback_reason_rate.labels(reason="p99_e2e")._value.get()
+            - (1 / 3)
+        )
+        < 1e-9
+    )
+
+
+def test_route_with_snapshot_records_decisions():
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    req = FakeRequest({"session_id": "abc"})
+    r._update_hash_ring(eps)
+    initial = r.hash_ring.get_node("abc")
+
+    # under threshold -> sticky recorded
+    es_ok = _stats({"http://e1": 0, "http://e2": 0, "http://e3": 0})
+    r._route_with_snapshot(eps, es_ok, req, {})
+    total, fallback, _ = r.get_window_stats()
+    assert total == 1 and fallback == 0
+
+    # overload sticky engine -> fallback recorded with reason
+    es_bad = _stats(
+        {
+            u: (99 if u == initial else 0)
+            for u in ("http://e1", "http://e2", "http://e3")
+        }
+    )
+    r._route_with_snapshot(eps, es_bad, req, {})
+    total, fallback, reasons = r.get_window_stats()
+    assert total == 2 and fallback == 1
+    assert reasons["queue"] == 1
