@@ -1,0 +1,35 @@
+---
+description: 禁止在提交、注释、文档中出现 Cursor 痕迹
+alwaysApply: true
+---
+
+# 提交与代码中禁止 Cursor 痕迹
+
+在本仓库创建或改写 git commit、代码注释、文档、PR 描述时，**一律不得**出现任何 Cursor 相关字样，包括但不限于：
+
+- `Co-authored-by: Cursor`
+- `cursoragent@cursor.com`
+- commit message / 正文里的 "Cursor" / "cursor"
+- 代码注释、文档里的 "cursor"
+- PR 描述里替用户署名 Cursor
+
+## 要求
+
+1. **Author / Committer** 只用用户指定身份：`Saddss <2872669061@qq.com>`。
+2. **Commit message** 只写改动本身（what / why），不加 AI / Agent / Cursor 等 attribution。
+3. 若发现 commit 被工具自动加了 Cursor trailer，**立即 amend / rebase 清掉**再汇报。
+4. 每次 commit 后自检无 cursor 字眼：
+
+```bash
+git log -1 --format='%an <%ae>%n%B' | grep -i cursor   # 必须无输出
+```
+
+## 示例
+
+```text
+# 禁止
+Co-authored-by: Cursor <cursoragent@cursor.com>
+
+# 正确
+[Feat][Router] Add cache-aware overload routing thresholds
+```
