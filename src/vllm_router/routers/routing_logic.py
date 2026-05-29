@@ -18,6 +18,7 @@ import enum
 import math
 import random
 import threading
+import time
 from typing import Dict, List
 
 from fastapi import Request
@@ -40,7 +41,7 @@ from uhashring import HashRing
 from vllm_router.log import init_logger
 from vllm_router.service_discovery import EndpointInfo
 from vllm_router.stats.engine_stats import EngineStats
-from vllm_router.stats.request_stats import RequestStats
+from vllm_router.stats.request_stats import RequestStats, get_request_stats_monitor
 from vllm_router.utils import SingletonABCMeta
 
 logger = init_logger(__name__)
@@ -49,6 +50,7 @@ logger = init_logger(__name__)
 class RoutingLogic(str, enum.Enum):
     ROUND_ROBIN = "roundrobin"
     SESSION_BASED = "session"
+    CACHE_AWARE_LOAD_BALANCING = "cache_aware_load_balancing"
     KVAWARE = "kvaware"
     PREFIXAWARE = "prefixaware"
     DISAGGREGATED_PREFILL = "disaggregated_prefill"
@@ -207,6 +209,123 @@ class SessionRouter(RoutingInterface):
             url = self.hash_ring.get_node(session_id)
 
         return url
+
+
+class CacheAwareLoadBalancingRouter(RoutingInterface):
+    """
+    Session-stickiness routing with overload protection.
+
+    A request that carries a session id is normally routed to its hash-ring
+    engine (KV cache affinity, same as SessionRouter). If that engine is
+    overloaded it falls back to another engine. The fallback target is chosen
+    deterministically by (num_queuing_requests asc, p50 end-to-end latency asc):
+    queue length first, ties broken by the lower p50 e2e latency.
+
+    Overload is decided by per-engine thresholds; this layer wires the queue
+    threshold (``tolerate_waiting_requests``). Latency percentile thresholds are
+    added on top of the same ``_violated_reasons`` seam.
+    """
+
+    def __init__(
+        self,
+        session_key: str = None,
+        tolerate_waiting_requests: int = 20,
+    ):
+        if hasattr(self, "_initialized"):
+            return
+        if session_key is None:
+            raise ValueError(
+                "CacheAwareLoadBalancingRouter must be initialized with a session_key"
+            )
+        self.session_key = session_key
+        self.tolerate_waiting_requests = tolerate_waiting_requests
+        self.hash_ring = HashRing()
+        self._initialized = True
+
+    def _overload_snapshot(self) -> Dict[str, Dict[str, float]]:
+        """Latency percentiles per engine; empty if the monitor is unavailable."""
+        try:
+            return get_request_stats_monitor().get_overload_snapshot(time.time())
+        except ValueError:
+            return {}
+
+    def _violated_reasons(
+        self,
+        url: str,
+        engine_stats: Dict[str, EngineStats],
+        snapshot: Dict[str, Dict[str, float]],
+    ) -> List[str]:
+        """Return the threshold names ``url`` currently violates (empty if OK)."""
+        reasons: List[str] = []
+        stats = engine_stats.get(url)
+        if (
+            stats is not None
+            and self.tolerate_waiting_requests > 0
+            and stats.num_queuing_requests >= self.tolerate_waiting_requests
+        ):
+            reasons.append("queue")
+        return reasons
+
+    def _fallback_sort_key(
+        self,
+        url: str,
+        engine_stats: Dict[str, EngineStats],
+        snapshot: Dict[str, Dict[str, float]],
+    ):
+        stats = engine_stats.get(url)
+        queue = stats.num_queuing_requests if stats is not None else 0
+        p50_e2e = snapshot.get(url, {}).get("p50_e2e", -1)
+        # Unknown latency (-1) is deprioritised in the tie-break.
+        p50_e2e = p50_e2e if p50_e2e >= 0 else float("inf")
+        return (queue, p50_e2e)
+
+    def _select_fallback(
+        self,
+        initial_url: str,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        snapshot: Dict[str, Dict[str, float]],
+    ) -> str:
+        candidates = [
+            e.url
+            for e in endpoints
+            if not self._violated_reasons(e.url, engine_stats, snapshot)
+        ]
+        if not candidates:
+            # Every engine is overloaded: keep KV cache affinity.
+            return initial_url
+        return min(
+            candidates,
+            key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot),
+        )
+
+    def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+    ) -> str:
+        """
+        Route a request, sticking sessions to their hash-ring engine unless it
+        is overloaded, in which case fall back to the best other engine.
+        """
+        self._update_hash_ring(endpoints)
+        session_id = request.headers.get(self.session_key, None)
+
+        if session_id is None:
+            # Production traffic always carries a session id; this defensive
+            # branch simply picks the least-loaded engine.
+            return min(
+                (e.url for e in endpoints),
+                key=lambda u: self._fallback_sort_key(u, engine_stats, {}),
+            )
+
+        initial_url = self.hash_ring.get_node(session_id)
+        snapshot = self._overload_snapshot()
+        if not self._violated_reasons(initial_url, engine_stats, snapshot):
+            return initial_url
+        return self._select_fallback(initial_url, endpoints, engine_stats, snapshot)
 
 
 class KvawareRouter(RoutingInterface):
@@ -461,6 +580,14 @@ def initialize_routing_logic(
     elif routing_logic == RoutingLogic.SESSION_BASED:
         logger.info(f"Initializing session-based routing logic with kwargs: {kwargs}")
         return SessionRouter(kwargs.get("session_key"))
+    elif routing_logic == RoutingLogic.CACHE_AWARE_LOAD_BALANCING:
+        logger.info(
+            f"Initializing cache-aware load balancing routing logic with kwargs: {kwargs}"
+        )
+        return CacheAwareLoadBalancingRouter(
+            session_key=kwargs.get("session_key"),
+            tolerate_waiting_requests=kwargs.get("tolerate_waiting_requests", 20),
+        )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")
         router = KvawareRouter(
@@ -489,6 +616,7 @@ def reconfigure_routing_logic(
     for cls in (
         SessionRouter,
         RoundRobinRouter,
+        CacheAwareLoadBalancingRouter,
         KvawareRouter,
         DisaggregatedPrefillRouter,
     ):
@@ -502,6 +630,7 @@ def get_routing_logic() -> RoutingInterface:
     for cls in (
         SessionRouter,
         RoundRobinRouter,
+        CacheAwareLoadBalancingRouter,
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,

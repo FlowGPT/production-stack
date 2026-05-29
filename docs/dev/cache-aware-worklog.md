@@ -52,7 +52,30 @@
 ### 结果
 - 单测：15 passed（6 新增 + 9 回归）。
 - lint：black/isort/ruff/codespell 全过。
-- 镜像冒烟：见下方构建记录。
-- commit：见提交后回填。
+- commit `7a5294b`（clean-commit，无 cursor 字眼）。
+- 镜像冒烟：`docker build --build-arg INSTALL_OPTIONAL_DEP=semantic_cache -t vllm-router-cacheaware:c1`（默认含 lmcache 的 extra 因 `lmcache==0.2.1` 当前不可解析而剔除，属既有 infra 问题，与本改动无关）；镜像内 `get_percentile`/`get_overload_snapshot` 实测 `p50=2.0 p99=2.98`、snapshot 可用，PASS。
+
+---
+
+## C2 — CacheAwareLoadBalancingRouter 核心（sticky + queue 阈值 + fallback）
+
+### 改了什么
+- `src/vllm_router/routers/routing_logic.py`：
+  - `RoutingLogic` 加 `CACHE_AWARE_LOAD_BALANCING`。
+  - 新增 `CacheAwareLoadBalancingRouter`：`route_request` 返回 `str`（与 RoundRobin/Session 同契约，不改 request.py，不破坏其他 router）。
+  - 逻辑：session 经 hash ring 选 initial；`_violated_reasons`（C2 仅 queue：`num_queuing_requests >= tolerate`）；命中则 `_select_fallback`：候选=未超限 engine，按 `(queue 升序, p50_e2e 升序)` 取 min，全员超限退回 initial；无 session 取最小负载。分位数经 `_overload_snapshot()`（monitor 未初始化时回退 `{}`）。
+  - `initialize_routing_logic`/`reconfigure_routing_logic`/`get_routing_logic` 注册新 router。
+- `src/vllm_router/parsers/parser.py`：`--routing-logic` 加 `cache_aware_load_balancing`；新增 `--cache-aware-tolerate-waiting-requests`(默认 20)；`validate_args` 要求该模式必须有 `--session-key`。
+- `src/vllm_router/app.py`：`initialize_routing_logic` 传 `tolerate_waiting_requests=args.cache_aware_tolerate_waiting_requests`。
+- `src/tests/test_cache_aware_router.py`：8 个单测（queue 触发、未知 engine、候选排除+最小 queue、p50_e2e tie-break、全员超限回退、sticky、fallback、无 session）。
+- `src/tests/perftest/fake-openai-server.py`：加 `--waiting` 以在集成层确定性 mock 队列深度。
+
+### 怎么测
+- 单测：`PYTHONPATH=src .../pytest src/tests/test_cache_aware_router.py test_overload_stats.py test_session_router.py test_singleton.py test_parser.py -q`
+- lint：black/isort/ruff/codespell。
+- 镜像集成：`docker build -t vllm-router-cacheaware:c2`，`--network host` 跑 router + 多个 stdlib mock 后端（无 vllm 依赖，可配 `waiting`），静态服务发现，发同 session 请求看 sticky / 把 sticky engine 队列拉高看 fallback。
+
+### 结果
+- 待回填（单测/lint/镜像）。
 
 ---

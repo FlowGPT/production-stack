@@ -183,6 +183,7 @@ def initialize_all(app: FastAPI, args):
     initialize_routing_logic(
         args.routing_logic,
         session_key=args.session_key,
+        tolerate_waiting_requests=args.cache_aware_tolerate_waiting_requests,
         lmcache_controller_port=args.lmcache_controller_port,
         prefill_model_labels=args.prefill_model_labels,
         decode_model_labels=args.decode_model_labels,

@@ -85,6 +85,11 @@ def validate_args(args):
         raise ValueError(
             "Session key must be provided when using session routing logic."
         )
+    if args.routing_logic == "cache_aware_load_balancing" and args.session_key is None:
+        raise ValueError(
+            "Session key must be provided when using cache_aware_load_balancing "
+            "routing logic."
+        )
     if args.log_stats and args.log_stats_interval <= 0:
         raise ValueError("Log stats interval must be greater than 0.")
     if args.engine_stats_interval <= 0:
@@ -166,11 +171,20 @@ def parse_args():
         choices=[
             "roundrobin",
             "session",
+            "cache_aware_load_balancing",
             "kvaware",
             "prefixaware",
             "disaggregated_prefill",
         ],
         help="The routing logic to use",
+    )
+    parser.add_argument(
+        "--cache-aware-tolerate-waiting-requests",
+        type=int,
+        default=20,
+        help="For --routing-logic cache_aware_load_balancing: if the session's "
+        "hash-ring engine has at least this many queueing requests, the request "
+        "falls back to another engine. Default 20.",
     )
     parser.add_argument(
         "--lmcache-controller-port",

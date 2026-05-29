@@ -139,6 +139,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 @app.get("/metrics")
 async def metrics():
     global NUM_RUNNING_REQUESTS, MODEL_NAME
+    # Allow tests to pin a fixed queue depth so overload routing can be
+    # exercised deterministically without real load.
+    waiting = float(GLOBAL_ARGS.waiting) if GLOBAL_ARGS else 0.0
     content = f"""# HELP vllm:num_requests_running Number of requests currently running on GPU.
 # TYPE vllm:num_requests_running gauge
 vllm:num_requests_running{{model_name="{MODEL_NAME}"}} {NUM_RUNNING_REQUESTS}
@@ -147,7 +150,7 @@ vllm:num_requests_running{{model_name="{MODEL_NAME}"}} {NUM_RUNNING_REQUESTS}
 vllm:num_requests_swapped{{model_name="{MODEL_NAME}"}} 0.0
 # HELP vllm:num_requests_waiting Number of requests waiting to be processed.
 # TYPE vllm:num_requests_waiting gauge
-vllm:num_requests_waiting{{model_name="{MODEL_NAME}"}} 0.0"""
+vllm:num_requests_waiting{{model_name="{MODEL_NAME}"}} {waiting}"""
 
     return Response(content=content, media_type="text/plain")
 
@@ -159,6 +162,12 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--speed", type=int, default=100)
     parser.add_argument("--ttft", type=float, default=0)
+    parser.add_argument(
+        "--waiting",
+        type=float,
+        default=0,
+        help="Fixed vllm:num_requests_waiting value reported on /metrics (for tests).",
+    )
     args = parser.parse_args()
     return args
 
