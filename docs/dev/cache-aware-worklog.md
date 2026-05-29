@@ -250,3 +250,29 @@ C6 的在途计数 `_pending` 按 `--cache-aware-inflight-decay`(5s) **时间衰
 - 全量 `pytest src/tests/ --ignore=test-openai.py` → **68 passed**；black/ruff/codespell 全过。
 - 镜像 `:c7` 同一 `prove1.sh`（candA 确认 wave2 时仍 in-flight=12）：**candA 峰值 18→14、candB 6→10** → 惊群回归基本消除（candA 多出的 2 个是 wave1 真实完成后正确释放所致）。
 - 正常不回归：粘滞 session×8 全落单引擎；单波 40 并发 → candA/candB 各 20 均衡。
+
+---
+
+## C8 — 缓解跨副本惊群（#2，多 router 副本）
+
+### 诊断（先证明）
+每个 router 进程只知道**自己**派发的在途请求；多副本不共享，导致跨副本惊群。
+
+复现（`prove2.sh`，c7，2 个 router 副本同后端，候选 delay=15s）：
+- router1 发 10 → 全落 candA（candA in-flight=10，持续）。
+- 治愈 candB；router2（独立副本，本地计数为空）发 10。
+- 结果 **candA 峰值 15 / candB 5**（理想 10/10）→ router2 不知道 router1 已把 10 个压在 candA → 把自己的一半又压上去。**缺陷证实。**
+
+### 修复（最小、对症）
+- `_fallback_sort_key` 的有效负载改为 `scraped_waiting + scraped_running + local_pending`。新增的 **scraped `num_requests_running`** 是唯一能聚合所有副本的信号（engine 上报自身真实负载），让 router2 经一次 scrape 后即可看到 candA 的真实在途并避开它。
+- **触发判定 `_violated_reasons` 不变**（仍按 queue/延迟），仅 fallback 的"选哪个最空"用 running。职责清晰：触发=是否过载，排序=谁最空。
+- 单副本下 `local_pending` 与 scraped_running 对本副本自身请求会短暂重复计数（派发即计 local，scrape 后又计 running）；方向偏保守（更倾向分散），安全，已记为已知偏置。
+
+### 验证
+- TDD 新增 `test_fallback_prefers_lower_scraped_running`；全量 `pytest` → **69 passed**；black/ruff 全过。
+- 镜像 `:c8` 同一 `prove2.sh`：**candA 峰值 15→13、candB 5→7** → 跨副本惊群改善（router2 经 scrape 看到 candA 负载后转向 candB）。
+- #1 不回归（c8 `prove1.sh`：14/10，与 c7 同）；正常不回归（粘滞 ×8 单引擎；单波 40 并发 20/20）。
+
+### 残留限制（诚实记录，未做 = 避免 over-engineering）
+- 跨副本只在**一次 scrape 之后**收敛；**同一 scrape 间隔内多副本同时突发**仍会部分惊群（13/7 中那 3 个即来自 scrape 滞后）。要更强需共享状态（如 Redis）或把 scrape 间隔调小。
+- 实操建议：多副本部署务必调小 `--engine-stats-interval`（3–5s）；单副本部署不受 #2 影响。

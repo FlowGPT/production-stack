@@ -346,13 +346,17 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     ):
         stats = engine_stats.get(url)
         queue = stats.num_queuing_requests if stats is not None else 0
-        # Add requests this router has in flight but the scrape has not yet seen,
-        # so concurrent fallbacks spread instead of herding onto one engine.
-        effective_queue = queue + self._pending_load(url, now)
+        # Scraped running count is the only load signal that aggregates ALL
+        # router replicas (the engine reports its true load), so include it to
+        # avoid cross-replica herding. It is stale by up to the scrape interval.
+        running = stats.num_running_requests if stats is not None else 0
+        # Add requests THIS router has in flight but the scrape has not yet seen,
+        # so concurrent fallbacks within one replica also spread immediately.
+        effective_load = queue + running + self._pending_load(url, now)
         p50_e2e = snapshot.get(url, {}).get("p50_e2e", -1)
         # Unknown latency (-1) is deprioritised in the tie-break.
         p50_e2e = p50_e2e if p50_e2e >= 0 else float("inf")
-        return (effective_queue, p50_e2e)
+        return (effective_load, p50_e2e)
 
     def _select_fallback(
         self,

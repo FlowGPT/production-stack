@@ -296,6 +296,19 @@ def test_completion_decrements_inflight():
     assert r._pending_load("http://e2", 1000.0) == 0
 
 
+def test_fallback_prefers_lower_scraped_running():
+    # Cross-replica signal: two candidates with equal queue=0, the one with
+    # lower scraped running (= aggregate load from all replicas) is chosen.
+    r = _fresh_router(tolerate_waiting_requests=5)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    es = {
+        "http://e1": EngineStats(num_queuing_requests=10),
+        "http://e2": EngineStats(num_queuing_requests=0, num_running_requests=8),
+        "http://e3": EngineStats(num_queuing_requests=0, num_running_requests=1),
+    }
+    assert r._select_fallback("http://e1", eps, es, {}, now=1000.0) == "http://e3"
+
+
 def test_long_inflight_not_forgotten_until_complete():
     # Core #1 regression: a long-running request stays counted for its whole
     # lifetime (well beyond any short window), not dropped on a fixed decay.
