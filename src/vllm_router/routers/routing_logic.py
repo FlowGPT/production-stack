@@ -230,6 +230,10 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         self,
         session_key: str = None,
         tolerate_waiting_requests: int = 20,
+        p50_ttft_threshold: float = 0.0,
+        p99_ttft_threshold: float = 0.0,
+        p50_e2e_threshold: float = 0.0,
+        p99_e2e_threshold: float = 0.0,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -239,6 +243,14 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             )
         self.session_key = session_key
         self.tolerate_waiting_requests = tolerate_waiting_requests
+        # Latency percentile thresholds in seconds; <= 0 disables that check.
+        # (snapshot_key, threshold) pairs evaluated in _violated_reasons.
+        self.latency_thresholds = {
+            "p50_ttft": p50_ttft_threshold,
+            "p99_ttft": p99_ttft_threshold,
+            "p50_e2e": p50_e2e_threshold,
+            "p99_e2e": p99_e2e_threshold,
+        }
         self.hash_ring = HashRing()
         self._initialized = True
 
@@ -264,6 +276,13 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             and stats.num_queuing_requests >= self.tolerate_waiting_requests
         ):
             reasons.append("queue")
+        engine_snapshot = snapshot.get(url, {})
+        for key, threshold in self.latency_thresholds.items():
+            if threshold and threshold > 0:
+                value = engine_snapshot.get(key, -1)
+                # value < 0 means "no completed requests yet" -> not a breach.
+                if value >= 0 and value >= threshold:
+                    reasons.append(key)
         return reasons
 
     def _fallback_sort_key(
@@ -310,6 +329,17 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         Route a request, sticking sessions to their hash-ring engine unless it
         is overloaded, in which case fall back to the best other engine.
         """
+        return self._route_with_snapshot(
+            endpoints, engine_stats, request, self._overload_snapshot()
+        )
+
+    def _route_with_snapshot(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request: Request,
+        snapshot: Dict[str, Dict[str, float]],
+    ) -> str:
         self._update_hash_ring(endpoints)
         session_id = request.headers.get(self.session_key, None)
 
@@ -318,11 +348,10 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             # branch simply picks the least-loaded engine.
             return min(
                 (e.url for e in endpoints),
-                key=lambda u: self._fallback_sort_key(u, engine_stats, {}),
+                key=lambda u: self._fallback_sort_key(u, engine_stats, snapshot),
             )
 
         initial_url = self.hash_ring.get_node(session_id)
-        snapshot = self._overload_snapshot()
         if not self._violated_reasons(initial_url, engine_stats, snapshot):
             return initial_url
         return self._select_fallback(initial_url, endpoints, engine_stats, snapshot)
@@ -587,6 +616,10 @@ def initialize_routing_logic(
         return CacheAwareLoadBalancingRouter(
             session_key=kwargs.get("session_key"),
             tolerate_waiting_requests=kwargs.get("tolerate_waiting_requests", 20),
+            p50_ttft_threshold=kwargs.get("p50_ttft_threshold", 0.0),
+            p99_ttft_threshold=kwargs.get("p99_ttft_threshold", 0.0),
+            p50_e2e_threshold=kwargs.get("p50_e2e_threshold", 0.0),
+            p99_e2e_threshold=kwargs.get("p99_e2e_threshold", 0.0),
         )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")

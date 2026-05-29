@@ -76,6 +76,29 @@
 - 镜像集成：`docker build -t vllm-router-cacheaware:c2`，`--network host` 跑 router + 多个 stdlib mock 后端（无 vllm 依赖，可配 `waiting`），静态服务发现，发同 session 请求看 sticky / 把 sticky engine 队列拉高看 fallback。
 
 ### 结果
-- 待回填（单测/lint/镜像）。
+- 单测：`test_cache_aware_router.py` 8 passed；合并回归 `overload_stats+session+singleton+parser` 全过（共 32 passed）。
+- lint：black/isort/ruff/codespell 全过（parser 单行条件按 black 修正）。
+- commit `830afb4`（clean，无 cursor 字眼）。
+- 镜像集成（`vllm-router-cacheaware:c2`，`--network host` + 3 stdlib mock 后端 9101/9102/9103，tolerate=5，engine-stats-interval=2）：
+  - 粘滞：session `alice` 连发 6 次 → 全部命中 e2（e1=0 e3=0），PASS。
+  - fallback：将粘滞引擎 e2 置 `waiting=99(≥5)`，e1/e3=0 → 6 次全部回退到 e1（e2=0 e3=0），命中 `(queue,p50_e2e)` 最优候选，PASS。
+
+---
+
+## C3 — p50/p99 TTFT + p50/p99 端到端 阈值
+
+### 改了什么
+- `src/vllm_router/routers/routing_logic.py`：`CacheAwareLoadBalancingRouter.__init__` 加 4 个阈值参数（默认 0=关闭），存入 `self.latency_thresholds`；`_violated_reasons` 增加延迟判定：阈值>0 且快照值>=阈值且>=0（有数据）才计入 reason（`p50_ttft/p99_ttft/p50_e2e/p99_e2e`）；`route_request` 抽出 `_route_with_snapshot(endpoints, engine_stats, request, snapshot)` 测试缝；工厂传 4 个阈值 kwargs。
+- `src/vllm_router/parsers/parser.py`：新增 `--cache-aware-p50-ttft-threshold`/`--cache-aware-p99-ttft-threshold`/`--cache-aware-p50-e2e-threshold`/`--cache-aware-p99-e2e-threshold`（float，默认 0）。
+- `src/vllm_router/app.py`：把 4 个阈值传入 `initialize_routing_logic`。
+- `src/tests/test_cache_aware_router.py`：新增 5 个单测（各延迟阈值触发/未触发、queue+延迟组合、阈值=0 关闭、无数据(-1)不触发、延迟阈值触发 fallback 经 `_route_with_snapshot`）。
+
+### 怎么测
+- 单测：`pytest src/tests/test_cache_aware_router.py test_overload_stats.py test_parser.py test_session_router.py test_singleton.py -q` → 37 passed。
+- lint：black/isort/ruff/codespell 全过。
+- 镜像集成：`vllm-router-cacheaware:c3`，给 mock 加 `--delay` 让粘滞引擎产生真实 e2e 延迟，设 `--cache-aware-p50-e2e-threshold` 验证延迟触发 fallback。
+
+### 结果
+- 待回填（镜像集成）。
 
 ---

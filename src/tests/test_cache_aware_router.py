@@ -101,3 +101,70 @@ def test_route_request_no_session_picks_least_queue():
     es = _stats({"http://e1": 7, "http://e2": 1, "http://e3": 4})
     req = FakeRequest({})  # no session id
     assert r.route_request(eps, es, {}, req) == "http://e2"
+
+
+def _snap(p50_ttft=-1, p99_ttft=-1, p50_e2e=-1, p99_e2e=-1):
+    return {
+        "p50_ttft": p50_ttft,
+        "p99_ttft": p99_ttft,
+        "p50_e2e": p50_e2e,
+        "p99_e2e": p99_e2e,
+    }
+
+
+def test_violated_reasons_latency_thresholds():
+    r = _fresh_router(
+        tolerate_waiting_requests=100,
+        p50_ttft_threshold=2.0,
+        p99_ttft_threshold=5.0,
+        p50_e2e_threshold=8.0,
+        p99_e2e_threshold=20.0,
+    )
+    es = _stats({"http://e1": 0})
+    over = {"http://e1": _snap(p50_ttft=3.0, p99_ttft=6.0, p50_e2e=9.0, p99_e2e=25.0)}
+    assert set(r._violated_reasons("http://e1", es, over)) == {
+        "p50_ttft",
+        "p99_ttft",
+        "p50_e2e",
+        "p99_e2e",
+    }
+    under = {"http://e1": _snap(p50_ttft=1.0, p99_ttft=4.0, p50_e2e=7.0, p99_e2e=19.0)}
+    assert r._violated_reasons("http://e1", es, under) == []
+
+
+def test_violated_reasons_queue_and_latency_combined():
+    r = _fresh_router(tolerate_waiting_requests=5, p99_e2e_threshold=10.0)
+    es = _stats({"http://e1": 9})
+    snap = {"http://e1": _snap(p99_e2e=15.0)}
+    reasons = r._violated_reasons("http://e1", es, snap)
+    assert reasons[0] == "queue"
+    assert "p99_e2e" in reasons
+
+
+def test_threshold_disabled_when_zero():
+    r = _fresh_router(tolerate_waiting_requests=5, p50_ttft_threshold=0.0)
+    es = _stats({"http://e1": 0})
+    snap = {"http://e1": _snap(p50_ttft=999.0)}
+    assert r._violated_reasons("http://e1", es, snap) == []
+
+
+def test_latency_no_data_does_not_trigger():
+    r = _fresh_router(tolerate_waiting_requests=5, p50_e2e_threshold=1.0)
+    es = _stats({"http://e1": 0})
+    # snapshot reports -1 (no completed requests) -> must not fall back
+    snap = {"http://e1": _snap(p50_e2e=-1)}
+    assert r._violated_reasons("http://e1", es, snap) == []
+
+
+def test_route_request_fallback_on_latency_threshold():
+    r = _fresh_router(tolerate_waiting_requests=100, p99_e2e_threshold=10.0)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    req = FakeRequest({"session_id": "abc"})
+    r._update_hash_ring(eps)
+    initial = r.hash_ring.get_node("abc")
+    others = [u for u in ("http://e1", "http://e2", "http://e3") if u != initial]
+    es = _stats({"http://e1": 0, "http://e2": 0, "http://e3": 0})
+    # only the sticky engine breaches the p99 e2e latency threshold
+    snapshot = {initial: _snap(p99_e2e=50.0)}
+    chosen = r._route_with_snapshot(eps, es, req, snapshot)
+    assert chosen in others

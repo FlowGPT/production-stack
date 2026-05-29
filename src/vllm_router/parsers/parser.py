@@ -187,6 +187,34 @@ def parse_args():
         "falls back to another engine. Default 20.",
     )
     parser.add_argument(
+        "--cache-aware-p50-ttft-threshold",
+        type=float,
+        default=0.0,
+        help="cache_aware_load_balancing: fall back when the sticky engine's p50 "
+        "TTFT (seconds) reaches this value. <= 0 disables the check. Default 0.",
+    )
+    parser.add_argument(
+        "--cache-aware-p99-ttft-threshold",
+        type=float,
+        default=0.0,
+        help="cache_aware_load_balancing: fall back when the sticky engine's p99 "
+        "TTFT (seconds) reaches this value. <= 0 disables the check. Default 0.",
+    )
+    parser.add_argument(
+        "--cache-aware-p50-e2e-threshold",
+        type=float,
+        default=0.0,
+        help="cache_aware_load_balancing: fall back when the sticky engine's p50 "
+        "end-to-end latency (seconds) reaches this value. <= 0 disables. Default 0.",
+    )
+    parser.add_argument(
+        "--cache-aware-p99-e2e-threshold",
+        type=float,
+        default=0.0,
+        help="cache_aware_load_balancing: fall back when the sticky engine's p99 "
+        "end-to-end latency (seconds) reaches this value. <= 0 disables. Default 0.",
+    )
+    parser.add_argument(
         "--lmcache-controller-port",
         type=int,
         default=9000,
