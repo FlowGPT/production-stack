@@ -102,6 +102,24 @@ class MovingAverageMonitor:
     def get_sum(self) -> float:
         return sum(self.values)
 
+    def get_percentile(self, q: float) -> float:
+        """
+        Return the q-th percentile (q in [0, 1]) of the values currently in the
+        sliding window using linear interpolation. Returns -1 if there are no
+        values, matching the "no data" sentinel used by get_average().
+        """
+        if not self.values:
+            return -1
+        ordered = sorted(self.values)
+        n = len(ordered)
+        if n == 1:
+            return ordered[0]
+        pos = q * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        frac = pos - lo
+        return ordered[lo] * (1 - frac) + ordered[hi] * frac
+
 
 class RequestStatsMonitor(metaclass=SingletonMeta):
     """
@@ -138,6 +156,13 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
 
         # Counter for swapped requests
         self.swapped_requests: Dict[str, int] = {}
+
+        # TTL-cached per-engine latency percentiles for overload routing.
+        # Recomputed at most every _overload_refresh_interval seconds so the
+        # request hot path only does a dict lookup instead of sorting.
+        self._overload_cache: Dict[str, Dict[str, float]] = {}
+        self._overload_cache_ts: float = 0.0
+        self._overload_refresh_interval: float = 1.0
 
         self.first_query_time: float = None
         self._initialized = True
@@ -304,6 +329,41 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
                 num_swapped_requests=swapped,
             )
         return ret
+
+    def get_overload_snapshot(self, now: float) -> Dict[str, Dict[str, float]]:
+        """
+        Return per-engine latency percentiles used by overload-aware routing:
+        {engine_url: {p50_ttft, p99_ttft, p50_e2e, p99_e2e}}.
+
+        Percentiles are computed from the existing TTFT / latency sliding
+        windows. The result is cached for _overload_refresh_interval seconds so
+        the per-request routing path stays O(1); a value of -1 means "no data".
+        """
+        if (
+            self._overload_cache
+            and now - self._overload_cache_ts < self._overload_refresh_interval
+        ):
+            return self._overload_cache
+
+        snapshot: Dict[str, Dict[str, float]] = {}
+        urls = set(self.ttft_monitors.keys()).union(set(self.latency_monitors.keys()))
+        for url in urls:
+            ttft_mon = self.ttft_monitors.get(url)
+            lat_mon = self.latency_monitors.get(url)
+            if ttft_mon is not None:
+                ttft_mon.update_no_value(now)
+            if lat_mon is not None:
+                lat_mon.update_no_value(now)
+            snapshot[url] = {
+                "p50_ttft": ttft_mon.get_percentile(0.5) if ttft_mon else -1,
+                "p99_ttft": ttft_mon.get_percentile(0.99) if ttft_mon else -1,
+                "p50_e2e": lat_mon.get_percentile(0.5) if lat_mon else -1,
+                "p99_e2e": lat_mon.get_percentile(0.99) if lat_mon else -1,
+            }
+
+        self._overload_cache = snapshot
+        self._overload_cache_ts = now
+        return snapshot
 
 
 def initialize_request_stats_monitor(sliding_window_size: float):
