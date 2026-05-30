@@ -131,6 +131,22 @@
 - `vllm:cache_aware_fallback_reason_rate{reason}`：各原因的 fallback 率，`reason ∈ {queue, p50_ttft, p99_ttft, p50_e2e, p99_e2e}`。
 - `vllm:cache_aware_inflight_requests{server}`：本路由器对各引擎的在途请求数。
 
+### 6.1 日志
+
+路由决策在 `CacheAwareLoadBalancingRouter._route_with_snapshot` 中输出日志：
+
+- 发生 fallback（转发至其他引擎）：`INFO` 级，格式为
+
+  ```
+  cache_aware fallback: session=<id> from=<原引擎> to=<目标引擎> reasons=[...]
+    from_load=[queue=.. running=.. inflight=.. p50_ttft=.. p99_ttft=.. p50_e2e=.. p99_e2e=..]
+    to_load=[...]
+  ```
+
+  其中 `reasons` 为被触发的阈值名称列表（`queue` / `p50_ttft` / `p99_ttft` / `p50_e2e` / `p99_e2e`，可多项同时触发），`from_load` / `to_load` 为两台引擎在决策时刻的实际负载与延迟分位数，便于定位转发原因与目标选择依据。
+- 所有引擎均过载、退回原引擎：`WARNING` 级，包含触发原因与原引擎负载。
+- 正常粘滞（未过载）：`DEBUG` 级，默认不输出，避免每请求刷屏；排障时可调高日志级别查看。
+
 ---
 
 ## 7. 使用说明
@@ -233,5 +249,7 @@ vllm-router \
 | `7ae7410` | 代码评审收口 |
 | `7fb68eb` | 故障路径释放在途计数；新增在途指标 |
 | `5c1b5ae` | 修复统计字典内存泄漏；补充回归测试 |
+| `52c1c33` | 文档改写为正式说明并补充使用说明 |
+| `<待回填>` | fallback 决策结构化日志（含原因与两端负载） |
 
 测试：单元测试全量 79 项通过；稳定性测试 P1–P5（故障注入、引擎增删、30 分钟长稳、过载、多副本）均通过，详见对应提交。

@@ -465,13 +465,59 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         if not reasons:
             self._record(now, False, [])
             self._record_dispatch(now, initial_url)
+            logger.debug(
+                "cache_aware sticky: session=%s engine=%s %s",
+                session_id,
+                initial_url,
+                self._engine_load_str(initial_url, engine_stats, snapshot, now),
+            )
             return initial_url
         self._record(now, True, reasons)
         chosen = self._select_fallback(
             initial_url, endpoints, engine_stats, snapshot, now
         )
         self._record_dispatch(now, chosen)
+        if chosen == initial_url:
+            logger.warning(
+                "cache_aware fallback: session=%s sticky engine %s overloaded "
+                "(reasons=%s %s) but all engines overloaded; staying on it",
+                session_id,
+                initial_url,
+                reasons,
+                self._engine_load_str(initial_url, engine_stats, snapshot, now),
+            )
+        else:
+            logger.info(
+                "cache_aware fallback: session=%s from=%s to=%s reasons=%s "
+                "from_load=[%s] to_load=[%s]",
+                session_id,
+                initial_url,
+                chosen,
+                reasons,
+                self._engine_load_str(initial_url, engine_stats, snapshot, now),
+                self._engine_load_str(chosen, engine_stats, snapshot, now),
+            )
         return chosen
+
+    def _engine_load_str(
+        self,
+        url: str,
+        engine_stats: Dict[str, EngineStats],
+        snapshot: Dict[str, Dict[str, float]],
+        now: float,
+    ) -> str:
+        """Human-readable load snapshot of one engine for log lines."""
+        stats = engine_stats.get(url)
+        queue = stats.num_queuing_requests if stats is not None else -1
+        running = stats.num_running_requests if stats is not None else -1
+        snap = snapshot.get(url, {})
+        return (
+            f"queue={queue} running={running} inflight={self._pending_load(url, now)} "
+            f"p50_ttft={snap.get('p50_ttft', -1):.3f} "
+            f"p99_ttft={snap.get('p99_ttft', -1):.3f} "
+            f"p50_e2e={snap.get('p50_e2e', -1):.3f} "
+            f"p99_e2e={snap.get('p99_e2e', -1):.3f}"
+        )
 
     def _evict(self, now: float) -> None:
         cutoff = now - self.stats_window
