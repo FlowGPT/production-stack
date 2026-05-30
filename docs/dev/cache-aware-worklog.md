@@ -131,6 +131,14 @@
 - `vllm:cache_aware_fallback_reason_rate{reason}`：各原因的 fallback 率，`reason ∈ {queue, p50_ttft, p99_ttft, p50_e2e, p99_e2e}`。
 - `vllm:cache_aware_inflight_requests{server}`：本路由器对各引擎的在途请求数。
 
+累积计数器（自路由器启动起单调递增，配合 Prometheus `rate()` 可计算任意窗口的速率，不随 `stats-window` 衰减）：
+
+- `vllm:cache_aware_sticky_total`：粘滞决策累计次数。
+- `vllm:cache_aware_fallback_total`：fallback 累计次数。
+- `vllm:cache_aware_fallback_reason_total{reason}`：各原因触发 fallback 的累计次数。
+
+第 6 节中以 `_rate` 结尾的 Gauge 为窗口内即时比率，便于直接观察；上述以 `_total` 结尾的 Counter 为累积量，便于在 Grafana 中自定义统计窗口。
+
 ### 6.1 日志
 
 路由决策在 `CacheAwareLoadBalancingRouter._route_with_snapshot` 中输出日志：

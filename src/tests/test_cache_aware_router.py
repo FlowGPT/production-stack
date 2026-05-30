@@ -4,8 +4,11 @@ from vllm_router.routers.routing_logic import CacheAwareLoadBalancingRouter
 from vllm_router.services.metrics_service import (
     cache_aware_fallback_rate,
     cache_aware_fallback_reason_rate,
+    cache_aware_fallback_reason_total,
+    cache_aware_fallback_total,
     cache_aware_inflight_requests,
     cache_aware_stickiness_rate,
+    cache_aware_sticky_total,
 )
 from vllm_router.stats.engine_stats import EngineStats
 from vllm_router.stats.request_stats import (
@@ -255,6 +258,24 @@ def test_window_rate_gauges():
         )
         < 1e-9
     )
+
+
+def test_cumulative_counters_monotonic():
+    r = _fresh_router(stats_window=30.0)
+    s0 = cache_aware_sticky_total._value.get()
+    f0 = cache_aware_fallback_total._value.get()
+    q0 = cache_aware_fallback_reason_total.labels(reason="queue")._value.get()
+    r._record(1000.0, False, [])
+    r._record(1001.0, True, ["queue"])
+    r._record(1002.0, True, ["queue", "p99_e2e"])
+    assert cache_aware_sticky_total._value.get() - s0 == 1
+    assert cache_aware_fallback_total._value.get() - f0 == 2
+    assert (
+        cache_aware_fallback_reason_total.labels(reason="queue")._value.get() - q0 == 2
+    )
+    # counters do not decay with the window
+    r.refresh_window_metrics(now=1000.0 + 100.0)
+    assert cache_aware_fallback_total._value.get() - f0 == 2
 
 
 def test_refresh_window_metrics_decays_when_idle():

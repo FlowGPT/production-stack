@@ -1,4 +1,4 @@
-from prometheus_client import Gauge
+from prometheus_client import Counter, Gauge
 
 # --- Prometheus Gauges ---
 # Existing metrics
@@ -64,4 +64,18 @@ cache_aware_inflight_requests = Gauge(
     "vllm:cache_aware_inflight_requests",
     "Requests this router has dispatched to each engine but not yet seen complete",
     ["server"],
+)
+# Cumulative counters since router start (use rate() in Prometheus for any window).
+cache_aware_sticky_total = Counter(
+    "vllm:cache_aware_sticky_total",
+    "Total session requests routed to their sticky engine",
+)
+cache_aware_fallback_total = Counter(
+    "vllm:cache_aware_fallback_total",
+    "Total session requests that fell back off the sticky engine",
+)
+cache_aware_fallback_reason_total = Counter(
+    "vllm:cache_aware_fallback_reason_total",
+    "Total session requests that fell back due to each threshold",
+    ["reason"],
 )

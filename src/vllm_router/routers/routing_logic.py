@@ -44,8 +44,11 @@ from vllm_router.service_discovery import EndpointInfo
 from vllm_router.services.metrics_service import (
     cache_aware_fallback_rate,
     cache_aware_fallback_reason_rate,
+    cache_aware_fallback_reason_total,
+    cache_aware_fallback_total,
     cache_aware_inflight_requests,
     cache_aware_stickiness_rate,
+    cache_aware_sticky_total,
 )
 from vllm_router.stats.engine_stats import EngineStats
 from vllm_router.stats.request_stats import RequestStats, get_request_stats_monitor
@@ -530,7 +533,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
                 self._win_reason[reason] -= 1
 
     def _record(self, now: float, is_fallback: bool, reasons: List[str]) -> None:
-        """Record one session routing decision and refresh the rate gauges."""
+        """Record one session routing decision: update window gauges and counters."""
         reasons = tuple(reasons)
         self._events.append((now, is_fallback, reasons))
         self._win_total += 1
@@ -538,6 +541,13 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             self._win_fallback += 1
         for reason in reasons:
             self._win_reason[reason] += 1
+        # Cumulative counters (monotonic; Prometheus computes rates over any window).
+        if is_fallback:
+            cache_aware_fallback_total.inc()
+            for reason in reasons:
+                cache_aware_fallback_reason_total.labels(reason=reason).inc()
+        else:
+            cache_aware_sticky_total.inc()
         self._evict(now)
         self._publish_gauges()
 
