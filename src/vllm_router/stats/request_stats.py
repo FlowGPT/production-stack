@@ -246,6 +246,11 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
                 timestamp, time.time() - request_start_time
             )
 
+        # Drop per-request bookkeeping so these dicts do not grow unbounded with
+        # every unique request id (otherwise a long-lived router slowly leaks).
+        self.request_start_time.pop((engine_url, request_id), None)
+        self.first_token_time.pop((engine_url, request_id), None)
+
     def on_request_swapped(self, engine_url: str, request_id: str, timestamp: float):
         # This function should be called if a request is determined to be swapped from GPU to CPU.
         """

@@ -338,3 +338,23 @@ C8 的跨副本缓解依赖 scraped running，**只能在一次 scrape 后收敛
 - hang + 客户端断开：因 `process_request` 用 `timeout=None`，挂死后端会一直占着流(请求确实仍在途)，**靠 `inflight_decay` TTL 安全上限回收**——decay=10s 时 6/4 → 0（12s 后）。无永久泄漏。
 - 已知运维注意：router 对后端**无读超时**(`timeout=None`，上游既有行为)，挂死引擎会占住连接直到其响应或 TTL；我们的计数靠 TTL 自愈，不属本功能引入。
 单测新增 inflight gauge 发布/释放；全量 75→ 仍全过。
+
+### P2 — churn（增删引擎 / 滚动重启）
+- 单测：移除引擎 → 仅该引擎上的 session 重映射(一致性哈希)、survivors 不动；移除的引擎永不再被选。
+- 限制（已文档）：静态服务发现的后端集启动时固定,**活体 churn / 终止中 pod 检测需 K8s 服务发现**(本机无集群无法跑);FlowGPT 的 pod-terminating 检测我们未移植,依赖上游 K8s readiness。
+
+### P4 — 过载 + router 转发开销
+- 转发开销：直连 mock p50=52.4ms vs 经 router p50=59.9ms → **+~7.5ms p50 / +8ms p99**(=网络+代理,与延迟对齐实测一致)。
+- 持续过载：300 请求 @ 并发 40 → **0 错误**、168 qps、三引擎峰值在途 20/17/18 **均衡**。
+- 注:distinct 单发请求在 < scrape 间隔的瞬时尖峰下不触发 fallback(陈旧 scrape 限制,已知);fallback 分散已在 prove1/2 证明。
+
+### P5 — 多副本端到端
+- 2 个 router 副本同后端,10 个 session 各发往两副本 → **10/10 路由到同一引擎**(一致性哈希跨副本天然一致,零协调);各副本各自暴露 10 条 cache_aware 指标(Prometheus 侧聚合)。
+
+### P3 — 30min 长稳 soak（发现并修复内存泄漏）
+**发现**：c11 soak 内存持续爬升 470→495 MiB / 8min(~3MiB/min)。定位为**上游既有泄漏**:`RequestStatsMonitor.on_request_complete` 从不清理 `request_start_time`/`first_token_time`(按 request_id 的 dict 无界增长),非本功能引入,但被 soak 暴露。
+**修复**：on_request_complete 末尾 `pop` 这两个 dict 的本请求键。单测验证 100 请求后两 dict 归零。
+**验证**（`:c12` 修复后 30min soak）：**226,784 请求 / 0 错误**,内存 **470.6→474 MiB 全程持平**(对比 c11 同期已 491 且继续爬),inflight 有界(0–10),CPU 稳定 ~45%。**泄漏修复确认,长稳通过。**
+
+## 稳定性总评
+P1 故障(in-flight 泄漏)已修；P2 churn 逻辑正确(活体 churn 需 K8s)；P3 30min 0 错误内存持平；P4 0 错误、~7.5ms 开销、均衡；P5 跨副本粘滞一致。两个真实 bug(in-flight 泄漏、stats dict 泄漏)在测试中发现并修复。

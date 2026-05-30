@@ -75,6 +75,19 @@ def test_overload_snapshot_ttl_cache():
     assert snap3[url]["p99_ttft"] > p99_first
 
 
+def test_request_bookkeeping_cleaned_on_complete():
+    # Per-request dicts must not grow unbounded across unique request ids.
+    m = _fresh_monitor()
+    url = "http://e1"
+    for i in range(100):
+        rid = f"r{i}"
+        m.on_new_request(url, rid, 1000.0 + i)
+        m.on_request_response(url, rid, 1000.0 + i + 0.1)
+        m.on_request_complete(url, rid, 1000.0 + i + 0.5)
+    assert len(m.request_start_time) == 0
+    assert len(m.first_token_time) == 0
+
+
 def test_overload_snapshot_no_data_sentinel():
     m = _fresh_monitor()
     url = "http://e1"

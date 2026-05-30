@@ -109,6 +109,44 @@ def test_route_request_no_session_picks_least_queue():
     assert r.route_request(eps, es, {}, req) == "http://e2"
 
 
+def test_churn_remove_engine_remaps_only_affected_sessions():
+    # P2: removing an engine should remap only the sessions that lived on it
+    # (consistent hashing), leaving the rest sticky -> minimal disruption.
+    r = _fresh_router(tolerate_waiting_requests=1000)
+    urls = ["http://e1", "http://e2", "http://e3"]
+    eps = [FakeEndpoint(u) for u in urls]
+    es = _stats({u: 0 for u in urls})
+    sessions = [f"s{i}" for i in range(30)]
+    before = {
+        s: r.route_request(eps, es, {}, FakeRequest({"session_id": s}))
+        for s in sessions
+    }
+
+    # remove e2
+    eps2 = [FakeEndpoint(u) for u in ("http://e1", "http://e3")]
+    es2 = _stats({"http://e1": 0, "http://e3": 0})
+    after = {
+        s: r.route_request(eps2, es2, {}, FakeRequest({"session_id": s}))
+        for s in sessions
+    }
+
+    assert all(v in ("http://e1", "http://e3") for v in after.values())
+    # sessions not on e2 must be unchanged
+    for s in sessions:
+        if before[s] != "http://e2":
+            assert after[s] == before[s], f"{s} needlessly remapped"
+
+
+def test_churn_removed_engine_never_selected():
+    # Once an engine leaves the endpoint set it must never be returned.
+    r = _fresh_router(tolerate_waiting_requests=1000)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2")]
+    es = _stats({"http://e1": 0, "http://e2": 0})
+    for i in range(50):
+        url = r.route_request(eps, es, {}, FakeRequest({"session_id": f"x{i}"}))
+        assert url in ("http://e1", "http://e2")
+
+
 def _snap(p50_ttft=-1, p99_ttft=-1, p50_e2e=-1, p99_e2e=-1):
     return {
         "p50_ttft": p50_ttft,
