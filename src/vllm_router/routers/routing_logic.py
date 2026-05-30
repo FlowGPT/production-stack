@@ -44,6 +44,7 @@ from vllm_router.service_discovery import EndpointInfo
 from vllm_router.services.metrics_service import (
     cache_aware_fallback_rate,
     cache_aware_fallback_reason_rate,
+    cache_aware_inflight_requests,
     cache_aware_stickiness_rate,
 )
 from vllm_router.stats.engine_stats import EngineStats
@@ -504,10 +505,15 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         """
         Evict expired events and republish the rate gauges. Called on /metrics
         scrape so the rates keep decaying to zero when traffic stops, instead of
-        freezing at the last recorded value.
+        freezing at the last recorded value. Also publishes per-engine in-flight.
         """
-        self._evict(time.time() if now is None else now)
+        now = time.time() if now is None else now
+        self._evict(now)
         self._publish_gauges()
+        for url in list(self._inflight.keys()):
+            cache_aware_inflight_requests.labels(server=url).set(
+                self._pending_load(url, now)
+            )
 
     def _publish_gauges(self) -> None:
         total = self._win_total

@@ -325,3 +325,16 @@ C8 的跨副本缓解依赖 scraped running，**只能在一次 scrape 后收敛
 ### 验证
 - 全量 `pytest src/tests/ --ignore=test-openai.py` → **75 passed**（新增 idle-decay、base no-op release_inflight 测试）；black/isort/ruff/codespell 全过。
 - 镜像 `:c10`：空闲衰减实测通过（见上）。
+
+---
+
+## 稳定性测试（上线前，P1–P5）
+
+### P1 — 故障注入（发现并修复 in-flight 泄漏）
+**发现**：`process_request` 的 `on_request_complete`/`release_inflight` 在 `async with stream` 块**之后**（非 finally），后端流异常/客户端中途断开时不会触发 → router in-flight 计数泄漏到 300s TTL 才回收。
+**修复**：把 streaming 包进 `try/finally`，`release_inflight(backend_url)` 放 finally → 任何退出路径都释放。新增 `vllm:cache_aware_inflight_requests{server}` gauge（router 侧每引擎在途，运维可观测 + 可测）。
+**实测**（`:c11`，mock 故障注入 abort/5xx/hang）：
+- abort / 5xx：in-flight gauge 故障后回 0 → **无泄漏**。
+- hang + 客户端断开：因 `process_request` 用 `timeout=None`，挂死后端会一直占着流(请求确实仍在途)，**靠 `inflight_decay` TTL 安全上限回收**——decay=10s 时 6/4 → 0（12s 后）。无永久泄漏。
+- 已知运维注意：router 对后端**无读超时**(`timeout=None`，上游既有行为)，挂死引擎会占住连接直到其响应或 TTL；我们的计数靠 TTL 自愈，不属本功能引入。
+单测新增 inflight gauge 发布/释放；全量 75→ 仍全过。

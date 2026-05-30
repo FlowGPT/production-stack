@@ -60,3 +60,8 @@ cache_aware_fallback_reason_rate = Gauge(
     "Fraction of session requests that fell back due to each threshold in the window",
     ["reason"],
 )
+cache_aware_inflight_requests = Gauge(
+    "vllm:cache_aware_inflight_requests",
+    "Requests this router has dispatched to each engine but not yet seen complete",
+    ["server"],
+)

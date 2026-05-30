@@ -4,6 +4,7 @@ from vllm_router.routers.routing_logic import CacheAwareLoadBalancingRouter
 from vllm_router.services.metrics_service import (
     cache_aware_fallback_rate,
     cache_aware_fallback_reason_rate,
+    cache_aware_inflight_requests,
     cache_aware_stickiness_rate,
 )
 from vllm_router.stats.engine_stats import EngineStats
@@ -229,6 +230,17 @@ def test_refresh_window_metrics_decays_when_idle():
     assert cache_aware_fallback_rate._value.get() == 0.0
     assert cache_aware_stickiness_rate._value.get() == 0.0
     assert cache_aware_fallback_reason_rate.labels(reason="queue")._value.get() == 0.0
+
+
+def test_inflight_gauge_published_and_released():
+    r = _fresh_router(tolerate_waiting_requests=5)
+    r._record_dispatch(1000.0, "http://e2")
+    r._record_dispatch(1000.0, "http://e2")
+    r.refresh_window_metrics(now=1000.0)
+    assert cache_aware_inflight_requests.labels(server="http://e2")._value.get() == 2
+    r.release_inflight("http://e2")
+    r.refresh_window_metrics(now=1000.0)
+    assert cache_aware_inflight_requests.labels(server="http://e2")._value.get() == 1
 
 
 def test_base_router_release_inflight_is_noop():

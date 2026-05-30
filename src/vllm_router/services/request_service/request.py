@@ -97,36 +97,40 @@ async def process_request(
     # For non-streaming requests, collect the full response to cache it properly
     full_response = bytearray()
 
-    async with request.app.state.httpx_client_wrapper().stream(
-        method=request.method,
-        url=backend_url + endpoint,
-        headers=dict(request.headers),
-        content=body,
-        timeout=None,
-    ) as backend_response:
-        # Yield headers and status code first.
-        yield backend_response.headers, backend_response.status_code
-        # Stream response content.
-        async for chunk in backend_response.aiter_bytes():
-            total_len += len(chunk)
-            if not first_token:
-                first_token = True
-                request.app.state.request_stats_monitor.on_request_response(
-                    backend_url, request_id, time.time()
-                )
-            # For non-streaming requests, collect the full response
-            if full_response is not None:
-                full_response.extend(chunk)
-            yield chunk
+    try:
+        async with request.app.state.httpx_client_wrapper().stream(
+            method=request.method,
+            url=backend_url + endpoint,
+            headers=dict(request.headers),
+            content=body,
+            timeout=None,
+        ) as backend_response:
+            # Yield headers and status code first.
+            yield backend_response.headers, backend_response.status_code
+            # Stream response content.
+            async for chunk in backend_response.aiter_bytes():
+                total_len += len(chunk)
+                if not first_token:
+                    first_token = True
+                    request.app.state.request_stats_monitor.on_request_response(
+                        backend_url, request_id, time.time()
+                    )
+                # For non-streaming requests, collect the full response
+                if full_response is not None:
+                    full_response.extend(chunk)
+                yield chunk
 
-    request.app.state.request_stats_monitor.on_request_complete(
-        backend_url, request_id, time.time()
-    )
-    # Let overload-aware routers decrement their in-flight count so fallback
-    # ranking reflects requests that have actually finished (no-op by default).
-    router = getattr(request.app.state, "router", None)
-    if router is not None:
-        router.release_inflight(backend_url)
+        request.app.state.request_stats_monitor.on_request_complete(
+            backend_url, request_id, time.time()
+        )
+    finally:
+        # Always release the router's in-flight slot, even if the backend stream
+        # errored or the client disconnected mid-stream; otherwise the count
+        # leaks until the safety TTL and skews fallback ranking (no-op router
+        # default).
+        router = getattr(request.app.state, "router", None)
+        if router is not None:
+            router.release_inflight(backend_url)
 
     # if debug_request:
     #    logger.debug(f"Finished the request with request id: {debug_request.headers.get('x-request-id', None)} at {time.time()}")
