@@ -15,6 +15,7 @@
 import abc
 import asyncio
 import enum
+import logging
 import math
 import random
 import threading
@@ -468,12 +469,15 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         if not reasons:
             self._record(now, False, [])
             self._record_dispatch(now, initial_url)
-            logger.debug(
-                "cache_aware sticky: session=%s engine=%s %s",
-                session_id,
-                initial_url,
-                self._engine_load_str(initial_url, engine_stats, snapshot, now),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                # Guard: _engine_load_str is evaluated eagerly as an argument, so
+                # only build it when DEBUG is actually enabled (this is the hot path).
+                logger.debug(
+                    "cache_aware sticky: session=%s engine=%s %s",
+                    session_id,
+                    initial_url,
+                    self._engine_load_str(initial_url, engine_stats, snapshot, now),
+                )
             return initial_url
         self._record(now, True, reasons)
         chosen = self._select_fallback(

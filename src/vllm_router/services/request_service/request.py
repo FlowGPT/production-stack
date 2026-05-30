@@ -131,6 +131,10 @@ async def process_request(
         router = getattr(request.app.state, "router", None)
         if router is not None:
             router.release_inflight(backend_url)
+        # Always drop per-request stats bookkeeping. on_request_complete already
+        # does this on the success path (idempotent); this covers stream errors
+        # and client disconnects so those dicts do not leak.
+        request.app.state.request_stats_monitor.discard_request(backend_url, request_id)
 
     # if debug_request:
     #    logger.debug(f"Finished the request with request id: {debug_request.headers.get('x-request-id', None)} at {time.time()}")

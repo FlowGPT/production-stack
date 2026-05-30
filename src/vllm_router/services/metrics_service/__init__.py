@@ -49,15 +49,19 @@ num_requests_swapped = Gauge(
 # Cache-aware load balancing routing metrics (sliding window probabilities).
 cache_aware_stickiness_rate = Gauge(
     "vllm:cache_aware_stickiness_rate",
-    "Fraction of session requests routed to their sticky engine in the window",
+    "Fraction of session requests whose sticky engine was not overloaded "
+    "(routed to it) in the window",
 )
 cache_aware_fallback_rate = Gauge(
     "vllm:cache_aware_fallback_rate",
-    "Fraction of session requests that fell back off the sticky engine in the window",
+    "Fraction of session requests whose sticky engine was overloaded "
+    "(fallback triggered; request stays on it only if all engines are overloaded) "
+    "in the window",
 )
 cache_aware_fallback_reason_rate = Gauge(
     "vllm:cache_aware_fallback_reason_rate",
-    "Fraction of session requests that fell back due to each threshold in the window",
+    "Fraction of session requests for which each threshold triggered fallback "
+    "in the window",
     ["reason"],
 )
 cache_aware_inflight_requests = Gauge(
@@ -68,14 +72,15 @@ cache_aware_inflight_requests = Gauge(
 # Cumulative counters since router start (use rate() in Prometheus for any window).
 cache_aware_sticky_total = Counter(
     "vllm:cache_aware_sticky_total",
-    "Total session requests routed to their sticky engine",
+    "Total session requests whose sticky engine was not overloaded",
 )
 cache_aware_fallback_total = Counter(
     "vllm:cache_aware_fallback_total",
-    "Total session requests that fell back off the sticky engine",
+    "Total session requests whose sticky engine was overloaded (fallback "
+    "triggered; stays on it only if all engines are overloaded)",
 )
 cache_aware_fallback_reason_total = Counter(
     "vllm:cache_aware_fallback_reason_total",
-    "Total session requests that fell back due to each threshold",
+    "Total session requests for which each threshold triggered fallback",
     ["reason"],
 )

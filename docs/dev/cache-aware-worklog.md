@@ -126,9 +126,9 @@
 
 通过 `/metrics` 暴露：
 
-- `vllm:cache_aware_stickiness_rate`：窗口内粘滞率。
-- `vllm:cache_aware_fallback_rate`：窗口内总 fallback 率。
-- `vllm:cache_aware_fallback_reason_rate{reason}`：各原因的 fallback 率，`reason ∈ {queue, p50_ttft, p99_ttft, p50_e2e, p99_e2e}`。
+- `vllm:cache_aware_stickiness_rate`：窗口内"粘滞引擎未过载"的请求占比。
+- `vllm:cache_aware_fallback_rate`：窗口内"粘滞引擎过载（触发 fallback）"的请求占比。注意：fallback 表示**触发了转发**；若所有引擎都过载，请求仍留在原引擎，但仍计入本指标。
+- `vllm:cache_aware_fallback_reason_rate{reason}`：各阈值触发 fallback 的占比，`reason ∈ {queue, p50_ttft, p99_ttft, p50_e2e, p99_e2e}`。
 - `vllm:cache_aware_inflight_requests{server}`：本路由器对各引擎的在途请求数。
 
 累积计数器（自路由器启动起单调递增，配合 Prometheus `rate()` 可计算任意窗口的速率，不随 `stats-window` 衰减）：
@@ -226,7 +226,8 @@ vllm-router \
 |---|---|---|
 | 并发 fallback 集中至单一引擎（惊群） | 引入在途计数；排序纳入 scraped running；并列时随机选择 | `c51c1ce` / `6298d20` / `beb37fc` |
 | 在途计数按固定时间衰减，长请求被提前忽略 | 改为请求结束时精确递减，时间窗口仅作安全上限 | `dce7ff3` |
-| 请求异常或客户端断开时在途计数未释放 | 将释放逻辑置于 `try/finally`，确保任意退出路径均释放 | `7fb68eb` |
+| 请求异常或客户端断开时在途计数未释放 | 将 `release_inflight` 置于 `try/finally`，任意退出路径均释放 | `7fb68eb` |
+| 失败路径未清理每请求统计字典 | `try/finally` 中调用 `RequestStatsMonitor.discard_request`，覆盖流出错与客户端断开 | （本次） |
 | 无流量时窗口指标停留在旧值 | `/metrics` 抓取时刷新并随时间衰减 | `7ae7410` |
 | `RequestStatsMonitor` 按 request_id 的字典无界增长（上游既有） | 请求结束时清除对应条目 | `5c1b5ae` |
 
@@ -260,4 +261,4 @@ vllm-router \
 | `52c1c33` | 文档改写为正式说明并补充使用说明 |
 | `5739b4a` | fallback 决策结构化日志（含原因与两端负载） |
 
-测试：单元测试全量 79 项通过；稳定性测试 P1–P5（故障注入、引擎增删、30 分钟长稳、过载、多副本）均通过，详见对应提交。
+测试：单元测试全量 81 项通过；稳定性测试 P1–P5（故障注入、引擎增删、30 分钟长稳、过载、多副本）均通过，详见对应提交。

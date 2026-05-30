@@ -88,6 +88,20 @@ def test_request_bookkeeping_cleaned_on_complete():
     assert len(m.first_token_time) == 0
 
 
+def test_discard_request_cleans_without_completion():
+    # Failure path: request never completes; discard_request must drop bookkeeping.
+    m = _fresh_monitor()
+    url = "http://e1"
+    m.on_new_request(url, "rX", 1000.0)
+    m.on_request_response(url, "rX", 1000.1)
+    assert ("http://e1", "rX") in m.request_start_time
+    m.discard_request(url, "rX")
+    assert ("http://e1", "rX") not in m.request_start_time
+    assert ("http://e1", "rX") not in m.first_token_time
+    # idempotent
+    m.discard_request(url, "rX")
+
+
 def test_overload_snapshot_no_data_sentinel():
     m = _fresh_monitor()
     url = "http://e1"

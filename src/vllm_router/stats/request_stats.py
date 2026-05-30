@@ -248,6 +248,14 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
 
         # Drop per-request bookkeeping so these dicts do not grow unbounded with
         # every unique request id (otherwise a long-lived router slowly leaks).
+        self.discard_request(engine_url, request_id)
+
+    def discard_request(self, engine_url: str, request_id: str):
+        """
+        Remove per-request bookkeeping for a request that will not complete
+        normally (stream error, client disconnect). Idempotent; safe to call
+        even after on_request_complete already cleaned up.
+        """
         self.request_start_time.pop((engine_url, request_id), None)
         self.first_token_time.pop((engine_url, request_id), None)
 
