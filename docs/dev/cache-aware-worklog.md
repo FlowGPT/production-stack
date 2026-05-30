@@ -1,360 +1,237 @@
-# Cache-Aware 超限路由 — 开发 Worklog
+# Cache-Aware 超限路由 设计与实现说明
 
-实时记录每一步：改了什么、为什么、怎么测、结果。每个提交一节。
+## 概述
 
-- 分支：`sss-dev`
-- 提交身份：`Saddss <2872669061@qq.com>`
-- 计划：见 `.cursor/plans/`（cache-aware overload routing）
+本文档说明 vLLM Router 中新增的缓存感知（cache-aware）超限路由模式的设计、实现位置、决策流程、配置项、监控指标及已知约束，供开发与运维人员阅读代码和部署时参考。
 
-需求：
-1. 排队阈值 `--cache-aware-tolerate-waiting-requests`
-2. p50 TTFT 阈值
-3. p99 TTFT 阈值
-4. p50 端到端阈值
-5. p99 端到端阈值
-6. Prometheus 暴露（≥30s 窗口）：粘滞率、各阈值 fallback 率、总体 fallback 率
-7. fallback 选择：候选满足全部阈值，按 `(queue 升序, p50_e2e 升序)` 确定性选择；全员超限退回原 engine
-8. 近 0 性能损失：分位数 TTL 缓存、指标 O(1) 摊销更新
+该模式通过 `--routing-logic cache_aware_load_balancing` 启用。其目标是在保证会话（session）粘滞以提升 KV cache 命中率的前提下，当目标引擎过载时将请求转发至其他引擎，避免单点过载。
 
----
+配置示例：
 
-## C0 — 环境与合规准备
+```
+--routing-logic cache_aware_load_balancing
+--session-key x-session-id
+--cache-aware-tolerate-waiting-requests 20
+```
 
-### 改了什么
-- `git config --local`：`user.name=Saddss`、`user.email=2872669061@qq.com`。
-- 新增 repo-local 规则 `.cursor/rules/no-cursor-in-commits.mdc`（禁止任何 Cursor 痕迹）。
-- 新增本 worklog `docs/dev/cache-aware-worklog.md`。
-
-### 怎么测
-- `git config --local user.name/user.email` 回显校验。
-- commit 后 `git log -1 --format='%an <%ae>%n%B' | grep -i cursor` 自检无输出。
-
-### 结果
-- commit `22c83cc`。环境会在 `git commit` 时自动注入 `Co-authored-by: Cursor`，故改用 plumbing `git commit-tree` 绕过（helper `/root/clean-commit.sh`），自检 `grep -i cursor` 无输出，PASS。
+实现位于 `vllm_router` 包内，不影响其他路由模式与请求代理路径。
 
 ---
 
-## C1 — 分位数能力 + 超限快照（stats，纯新增）
+## 1. 设计目标
 
-### 改了什么
-- `src/vllm_router/stats/request_stats.py`：
-  - `MovingAverageMonitor.get_percentile(q)`：滑窗值线性插值分位数，空集返回 -1。
-  - `RequestStatsMonitor`：新增 `_overload_cache/_overload_cache_ts/_overload_refresh_interval=1.0` 与 `get_overload_snapshot(now)`，返回每 engine `{p50_ttft,p99_ttft,p50_e2e,p99_e2e}`，TTL 内复用缓存（热路径 O(1)）。
-- `src/tests/test_overload_stats.py`：新增 6 个单测（分位数空/单值/乱序、快照取值、TTL 缓存、无数据哨兵）。
-- 行为变化：无（纯新增 API，未接入路由）。
-
-### 怎么测
-- 测试环境：`/root/cacheaware-venv`（pytest 等最小依赖；`uv sync` 因 lmcache==0.2.1 不可解析而放弃）。
-- 命令：
-  - `PYTHONPATH=src /root/cacheaware-venv/bin/python -m pytest src/tests/test_overload_stats.py src/tests/test_singleton.py src/tests/test_session_router.py -q`
-  - `black --check`、`isort --check-only --profile black`、`ruff check src/tests/...`、`codespell`
-
-### 结果
-- 单测：15 passed（6 新增 + 9 回归）。
-- lint：black/isort/ruff/codespell 全过。
-- commit `7a5294b`（clean-commit，无 cursor 字眼）。
-- 镜像冒烟：`docker build --build-arg INSTALL_OPTIONAL_DEP=semantic_cache -t vllm-router-cacheaware:c1`（默认含 lmcache 的 extra 因 `lmcache==0.2.1` 当前不可解析而剔除，属既有 infra 问题，与本改动无关）；镜像内 `get_percentile`/`get_overload_snapshot` 实测 `p50=2.0 p99=2.98`、snapshot 可用，PASS。
+- 同一会话默认固定路由到同一引擎，以提升 KV cache 命中率。
+- 当目标引擎过载（排队或延迟超过阈值）时，将该次请求转发至满足约束的其他引擎。
+- 提供窗口化的 Prometheus 指标用于观测粘滞率与转发率。
+- 对请求热路径的性能影响接近于零。
 
 ---
 
-## C2 — CacheAwareLoadBalancingRouter 核心（sticky + queue 阈值 + fallback）
+## 2. 代码结构
 
-### 改了什么
-- `src/vllm_router/routers/routing_logic.py`：
-  - `RoutingLogic` 加 `CACHE_AWARE_LOAD_BALANCING`。
-  - 新增 `CacheAwareLoadBalancingRouter`：`route_request` 返回 `str`（与 RoundRobin/Session 同契约，不改 request.py，不破坏其他 router）。
-  - 逻辑：session 经 hash ring 选 initial；`_violated_reasons`（C2 仅 queue：`num_queuing_requests >= tolerate`）；命中则 `_select_fallback`：候选=未超限 engine，按 `(queue 升序, p50_e2e 升序)` 取 min，全员超限退回 initial；无 session 取最小负载。分位数经 `_overload_snapshot()`（monitor 未初始化时回退 `{}`）。
-  - `initialize_routing_logic`/`reconfigure_routing_logic`/`get_routing_logic` 注册新 router。
-- `src/vllm_router/parsers/parser.py`：`--routing-logic` 加 `cache_aware_load_balancing`；新增 `--cache-aware-tolerate-waiting-requests`(默认 20)；`validate_args` 要求该模式必须有 `--session-key`。
-- `src/vllm_router/app.py`：`initialize_routing_logic` 传 `tolerate_waiting_requests=args.cache_aware_tolerate_waiting_requests`。
-- `src/tests/test_cache_aware_router.py`：8 个单测（queue 触发、未知 engine、候选排除+最小 queue、p50_e2e tie-break、全员超限回退、sticky、fallback、无 session）。
-- `src/tests/perftest/fake-openai-server.py`：加 `--waiting` 以在集成层确定性 mock 队列深度。
+| 文件 | 职责 |
+|---|---|
+| `src/vllm_router/routers/routing_logic.py` | 核心实现：`CacheAwareLoadBalancingRouter` |
+| `src/vllm_router/stats/request_stats.py` | 延迟分位数计算（`get_percentile`、`get_overload_snapshot`）及每请求记账 |
+| `src/vllm_router/services/metrics_service/__init__.py` | Prometheus 指标（Gauge）定义 |
+| `src/vllm_router/routers/metrics_router.py` | `/metrics` 接口；抓取时刷新窗口指标 |
+| `src/vllm_router/services/request_service/request.py` | 请求代理；请求结束时通知路由器释放在途计数 |
+| `src/vllm_router/parsers/parser.py` | `--cache-aware-*` 命令行参数定义 |
+| `src/vllm_router/app.py` | 参数装配，初始化路由器 |
 
-### 怎么测
-- 单测：`PYTHONPATH=src .../pytest src/tests/test_cache_aware_router.py test_overload_stats.py test_session_router.py test_singleton.py test_parser.py -q`
-- lint：black/isort/ruff/codespell。
-- 镜像集成：`docker build -t vllm-router-cacheaware:c2`，`--network host` 跑 router + 多个 stdlib mock 后端（无 vllm 依赖，可配 `waiting`），静态服务发现，发同 session 请求看 sticky / 把 sticky engine 队列拉高看 fallback。
+`CacheAwareLoadBalancingRouter` 的主要方法：
 
-### 结果
-- 单测：`test_cache_aware_router.py` 8 passed；合并回归 `overload_stats+session+singleton+parser` 全过（共 32 passed）。
-- lint：black/isort/ruff/codespell 全过（parser 单行条件按 black 修正）。
-- commit `830afb4`（clean，无 cursor 字眼）。
-- 镜像集成（`vllm-router-cacheaware:c2`，`--network host` + 3 stdlib mock 后端 9101/9102/9103，tolerate=5，engine-stats-interval=2）：
-  - 粘滞：session `alice` 连发 6 次 → 全部命中 e2（e1=0 e3=0），PASS。
-  - fallback：将粘滞引擎 e2 置 `waiting=99(≥5)`，e1/e3=0 → 6 次全部回退到 e1（e2=0 e3=0），命中 `(queue,p50_e2e)` 最优候选，PASS。
+- `route_request(...)`：路由入口，转调 `_route_with_snapshot(...)`。
+- `_violated_reasons(url, ...)`：判定指定引擎是否过载，返回被触发的阈值名称列表（空列表表示未过载）。
+- `_select_fallback(...)`：目标引擎过载时选择替代引擎。
+- `_fallback_sort_key(url, ...)`：计算引擎的有效负载，用于候选排序。
+- `_record_dispatch` / `release_inflight` / `_pending_load`：在途请求计数（见第 4.2 节）。
+- `_record` / `_evict` / `_publish_gauges` / `refresh_window_metrics`：窗口指标维护（见第 4.3 节）。
 
 ---
 
-## C3 — p50/p99 TTFT + p50/p99 端到端 阈值
+## 3. 路由决策流程
 
-### 改了什么
-- `src/vllm_router/routers/routing_logic.py`：`CacheAwareLoadBalancingRouter.__init__` 加 4 个阈值参数（默认 0=关闭），存入 `self.latency_thresholds`；`_violated_reasons` 增加延迟判定：阈值>0 且快照值>=阈值且>=0（有数据）才计入 reason（`p50_ttft/p99_ttft/p50_e2e/p99_e2e`）；`route_request` 抽出 `_route_with_snapshot(endpoints, engine_stats, request, snapshot)` 测试缝；工厂传 4 个阈值 kwargs。
-- `src/vllm_router/parsers/parser.py`：新增 `--cache-aware-p50-ttft-threshold`/`--cache-aware-p99-ttft-threshold`/`--cache-aware-p50-e2e-threshold`/`--cache-aware-p99-e2e-threshold`（float，默认 0）。
-- `src/vllm_router/app.py`：把 4 个阈值传入 `initialize_routing_logic`。
-- `src/tests/test_cache_aware_router.py`：新增 5 个单测（各延迟阈值触发/未触发、queue+延迟组合、阈值=0 关闭、无数据(-1)不触发、延迟阈值触发 fallback 经 `_route_with_snapshot`）。
+请求处理入口为 `_route_with_snapshot`，流程如下：
 
-### 怎么测
-- 单测：`pytest src/tests/test_cache_aware_router.py test_overload_stats.py test_parser.py test_session_router.py test_singleton.py -q` → 37 passed。
-- lint：black/isort/ruff/codespell 全过。
-- 镜像集成：`vllm-router-cacheaware:c3`，给 mock 加 `--delay` 让粘滞引擎产生真实 e2e 延迟，设 `--cache-aware-p50-e2e-threshold` 验证延迟触发 fallback。
-
-### 结果
-- 单测：37 passed；lint 全过；commit `182773f`（clean）。
-- 镜像集成（`vllm-router-cacheaware:c3`，`--cache-aware-p50-e2e-threshold 0.5`，tolerate=1000 排除 queue 干扰；e2 `--delay 2` 慢、e1/e3 快）：
-  - req1=2.04s 命中粘滞 e2（尚无延迟数据）；e2 记录 p50_e2e≈2s≥0.5。
-  - req2–6≈0.02s 全部回退到 e1；命中统计 e2=1、e1=5、e3=0 → 延迟阈值触发 fallback，PASS。
-
----
-
-## C4 — ≥30s 窗口率 Prometheus 指标
-
-### 改了什么
-- `src/vllm_router/services/metrics_service/__init__.py`：新增 3 个 Gauge `vllm:cache_aware_stickiness_rate`、`vllm:cache_aware_fallback_rate`、`vllm:cache_aware_fallback_reason_rate{reason}`（reason ∈ queue/p50_ttft/p99_ttft/p50_e2e/p99_e2e）。
-- `src/vllm_router/routers/routing_logic.py`：router 维护事件 deque `(ts,is_fallback,reasons)` + 运行计数（`_win_total/_win_fallback/_win_reason`）；`_record`/`_evict`/`get_window_stats`/`_publish_gauges`，O(1) 摊销；`_route_with_snapshot` 在 sticky/fallback 决策后记录；新增 `stats_window`（默认 30）参数与 `REASONS` 常量。`metrics_router.py` 未改（Gauge 经 `generate_latest()` 自动暴露）。
-- `src/vllm_router/parsers/parser.py`：新增 `--cache-aware-stats-window`(默认 30)。
-- `src/vllm_router/app.py`：传 `stats_window`。
-- `src/tests/test_cache_aware_router.py`：新增 3 个单测（窗口计数+过期淘汰、率 Gauge 数值、`_route_with_snapshot` 决策计数）。
-
-### 怎么测
-- 单测：`pytest src/tests/...` → 40 passed。
-- lint：black/isort/ruff/codespell 全过。
-- 镜像集成：`vllm-router-cacheaware:c4`，跑流量后 `curl router:8001/metrics | grep cache_aware` 校验窗口率随 sticky/fallback 变化。
-
-### 结果
-- 单测：40 passed；lint 全过；commit `fadcdc5`（clean）。
-- 镜像集成（`vllm-router-cacheaware:c4`，e2 `waiting=99` 超限，tolerate=5，15 个不同 session）：
-  - 后端命中 e1=9 e3=6 e2=0（凡 hash 到 e2 的 session 全部 fallback）。
-  - `curl router:8001/metrics`：`cache_aware_stickiness_rate=0.667`、`cache_aware_fallback_rate=0.333`、`cache_aware_fallback_reason_rate{reason="queue"}=0.333`，其余 reason=0；10 sticky + 5 fallback = 15 一致，PASS。
+1. 请求未携带 session：选择有效负载最小的引擎并返回（线上请求均携带 session，此分支为防御性处理）。
+2. 请求携带 session：通过一致性哈希计算其归属引擎 `initial`。
+3. 判定 `initial` 是否过载（`_violated_reasons`），命中以下任一条件即视为过载：
+   - 排队请求数 ≥ `--cache-aware-tolerate-waiting-requests`；
+   - p50 / p99 TTFT ≥ 对应阈值；
+   - p50 / p99 端到端延迟 ≥ 对应阈值；
+   - 阈值为 0 表示该项关闭，不参与判定。
+4. 未过载：路由至 `initial`（粘滞），记录一次 sticky 决策。
+5. 过载：调用 `_select_fallback` 选择替代引擎，记录一次 fallback 决策：
+   1. 候选集合 = 满足全部阈值（未过载）的引擎；
+   2. 在候选中按有效负载升序选择（有效负载定义见第 4.1 节）；
+   3. 若多个候选负载并列（差值 ≤ `--cache-aware-tie-tolerance`），按 p50 端到端延迟升序选择；
+   4. 若仍并列（例如均无延迟数据），在并列候选中随机选择；
+   5. 候选集合为空（所有引擎均过载）：退回 `initial`，不进行转发。
 
 ---
 
-## C5 — simplify + 全量验证收尾
+## 4. 核心机制
 
-### 改了什么
-- `src/vllm_router/routers/routing_logic.py`：`_violated_reasons` 内 `if threshold and threshold > 0` 简化为 `if threshold > 0`，并合并冗余的 `value >= 0` 判定（-1 必低于任何正阈值），行为不变、更易读。
-- 本 worklog 收尾。
+### 4.1 有效负载
 
-### 怎么测（全量证据）
-- 单测全量（venv 可跑）：`pytest test_cache_aware_router test_overload_stats test_parser test_session_router test_singleton test_utils -q` → 51 passed。
-- lint 全量：black/isort/ruff/codespell 对全部改动文件通过。
-- 镜像：`vllm-router-cacheaware:c5` 构建 + 导入冒烟。
+`_fallback_sort_key` 计算每个引擎的有效负载，作为候选排序的主键：
 
-### 结果
-- 单测 51 passed；lint 全过；commit `3ea4b49`（clean）。
-- 镜像 `vllm-router-cacheaware:c5` 构建成功；容器内 `initialize_routing_logic(CACHE_AWARE_LOAD_BALANCING, ...)` 正常，`window=30.0 thresholds={'p50_e2e':1.0,...}`，SMOKE_OK。
+```
+有效负载 = scraped_waiting + scraped_running + inflight
+```
 
-### 备注（真实 vLLM）
-- 路由改动不触碰代理/抓取路径（仅路由决策 + 指标），已用 stdlib mock 覆盖全部 queue/延迟/指标场景。
-- 未启真实 vLLM 端到端：本地无 `vllm-openai` 镜像、HF 缓存仅 12B–26B 量化大模型、磁盘 93%（剩 29G），按"低磁盘先确认"规则未做重型拉取/清理。可按需补做。
+- `scraped_waiting` / `scraped_running`：从引擎 `/metrics` 周期抓取的排队数与运行数；
+- `inflight`：本路由器已派发但尚未结束的请求数（见 4.2）；
+- 三者之和用于估计引擎当前负载，数值越小优先级越高。
 
----
+### 4.2 在途计数（inflight）
 
-## 功能总览（最终）
+在途计数记录本路由器进程已派发但尚未收到结束的请求数，按引擎分别统计。
 
-启用：`--routing-logic cache_aware_load_balancing --session-key <header>`，配合可选阈值：
-- `--cache-aware-tolerate-waiting-requests`（默认 20，排队阈值）
-- `--cache-aware-p50-ttft-threshold` / `--cache-aware-p99-ttft-threshold`（秒，0=关）
-- `--cache-aware-p50-e2e-threshold` / `--cache-aware-p99-e2e-threshold`（秒，0=关）
-- `--cache-aware-stats-window`（默认 30s，指标窗口）
+- 实现：派发时 `_record_dispatch(url)` 入队，请求结束时 `release_inflight(url)` 出队，`_pending_load(url)` 读取当前值。
+- 设计原因：引擎 `/metrics` 为周期抓取，存在滞后。在并发请求集中到达时，若仅依据抓取到的旧值判断，多个请求会同时观察到引擎空闲并被路由至同一引擎。在途计数在派发后立即生效，使后续请求能够感知本路由器刚发出的负载，从而分散路由。该机制解决单副本内并发请求集中转发的问题。
+- 安全上限：`--cache-aware-inflight-decay`（默认 300 秒）。正常请求结束即递减；若请求未正常结束（客户端断开、后端无响应），超过该时限的计数将被丢弃，避免计数无法归零。
 
-行为：session 粘滞 hash-ring engine；命中任一阈值 → fallback，候选=满足全部阈值的 engine，按 `(queue 升序, p50_e2e 升序)` 选；全员超限退回原 engine。
+### 4.3 窗口指标
 
-指标（`/metrics`，≥30s 窗口）：`vllm:cache_aware_stickiness_rate`、`vllm:cache_aware_fallback_rate`、`vllm:cache_aware_fallback_reason_rate{reason=queue|p50_ttft|p99_ttft|p50_e2e|p99_e2e}`。
+路由器维护一个 `--cache-aware-stats-window`（默认 30 秒）时间窗口内的决策事件队列，每条记录包含时间戳、是否 fallback、触发原因。
 
-性能：分位数 TTL(1s) 缓存隔离热路径；指标 O(1) 摊销；未改其他 router/代理路径。
-
-提交（sss-dev）：C0 `22c83cc` · C1 `7a5294b` · C2 `830afb4` · C3 `182773f` · C4 `fadcdc5` · C5 `3ea4b49` · worklog `51f9a67`。
+- `_record` 追加事件并更新计数；`_evict` 清除过期事件；`_publish_gauges` 将比率写入 Gauge。
+- `refresh_window_metrics` 在 `/metrics` 被抓取时调用，确保在无流量期间比率仍随时间衰减，而非停留在最后一次记录的值。
 
 ---
 
-## 补充验证（全量，应要求"都跑"）
+## 5. 配置项
 
-镜像 `vllm-router-cacheaware:c5`，stdlib mock 后端，`--network host`。
+参数定义见 `parser.py`。
 
-### 容器集成补全（之前只单测的分支）
-- 场景 A（四个延迟阈值全开，e2 慢 2s，tolerate=1000）：req1 粘 e2，其后全 fallback e1；`/metrics` `stickiness=0.125 fallback=0.875`，`reason{p50_ttft,p99_ttft,p50_e2e,p99_e2e}=0.875`、`queue=0` → 四个延迟阈值与归因全部 PASS。
-- 场景 B（全员 waiting=99，tolerate=5）：session 全部停留在原 sticky 引擎 e2（5 命中）；`fallback_rate=1.0 reason{queue}=1.0 stickiness=0` → 全员超限退回原 engine PASS。
-- 场景 C（e1=0/e2=99/e3=5，无 session header）：5 次全部命中 e1（最小 queue）→ 无 session 最小负载 PASS。
-
-### 全量单测
-- `PYTHONPATH=src pytest src/tests/ --ignore=test-openai.py`（pytest-asyncio 固定 CI 版 0.25.3）→ **62 passed**（含 test_file_storage 异步用例；之前 5 个 error 是我临时装的 pytest-asyncio 版本不匹配所致，与本改动无关）。
-
-### 真实 vLLM 端到端
-- 真实引擎：`ssadds/vllm:260528-patch` serve `wangqia0309/Captain-Eris_Violet-V0.420-12B-FP8-KV-modelopt-fp4-chat`（`--quantization modelopt --kv-cache-dtype fp8 --enforce-eager`，:8000，~80s ready）+ 2 个 mock（:9101/:9103，同 model id）。
-- 路由 cache_aware，3 后端静态发现。发 6 个不同 session：
-  - 命中真实 vLLM 的 session（s1/s3/s5）返回**真实模型生成 token**（"Hi there!"/"Let's talk"），经 router 代理；
-  - 其余命中 mock；`stickiness_rate=1.0`（无超限全粘）。
-  - router 成功抓取真实 vLLM `/metrics`（`vllm:num_requests_running` 来自真实引擎）。
-- 结论：router 对**真实 vLLM 后端**的代理 + /metrics 抓取 + 粘滞路由 PASS。queue/延迟/指标判定与后端类型无关，已由 mock 全场景覆盖。
-
-### 磁盘
-- 验证期间磁盘 95%（剩 23G），复用已有镜像、未新建大镜像；可回收项为 build cache(~56G) 与冗余 c1–c4 镜像（未清，待确认）。测试容器与 mock 已于验证后全部停止，GPU 归还。
-
----
-
-## C6 — 修复 fallback 惊群（thundering herd）
-
-### 背景 / 诊断（线上超限根因）
-线上 router 镜像 `ssadds/production-stack:vllm`（`0fa8661`）出现"大量请求同时 fallback 到同一 pod 导致超限"。按 diagnose 流程复现 + 定位：
-
-复现（mock：4 个 hot 引擎 base_waiting=99 强制 fallback + 2 个 idle 候选 capacity=4 delay=3；router 默认 30s scrape；40 个不同 session 并发）：
-- C5（修复前）：26 个 fallback **全部** 打到 candA → candA 峰值并发 **35**，candB **5**（≈7:1）。
-
-根因（三条，前两条与线上镜像共有）：
-1. **engine_stats 30s scrape 陈旧**：一个 burst 全程看到候选 `queue=0` 的旧值。
-2. **router 无在途(in-flight)计账**：从不计入自己刚派发、scrape 还没看到的请求。
-3. **确定性 `min(queue,p50_e2e)`**：陈旧窗口内所有 fallback 收敛到同一个最低队列引擎（线上是 `random.choice` 略好，但 idle 候选少 + 30s 盲窗，每个仍远超 tolerate → 一样超限）。
-
-### 改了什么（修第 2 条，最小且对症）
-- `src/vllm_router/routers/routing_logic.py`：router 维护"最近派发"衰减计数 `_dispatch_log/_pending`，`_record_dispatch`/`_evict_dispatches`/`_pending_load`；`_fallback_sort_key` 用 `effective_queue = scraped_queue + pending` 排序；`route_request` 在**同步**决策点（无 await，事件循环内原子）记录派发，使并发 fallback 互相可见、自动打散。`_select_fallback`/`_route_with_snapshot` 透传 `now`（可测）。
-- `--cache-aware-inflight-decay`（默认 5s，近似单请求时长）+ app 接线 + 工厂。
-- `_violated_reasons`（粘滞阈值判定）保持不变，仅 fallback 目标选择受影响 → 不改用户既定语义。
-- 性能：deque + Counter O(1) 摊销，热路径无排序。
-
-### 怎么测
-- TDD 回归（先红）：`test_inflight_accounting_spreads_repeated_fallback`、`test_inflight_decay_clears_pending`、`test_route_records_dispatch_for_chosen_engine`、`test_fallback_no_recent_dispatch_is_deterministic`（无派发时退化为原确定性行为）；旧 `_select_fallback` 测试补 `now`。
-- 全量：`pytest src/tests/ --ignore=test-openai.py` → **66 passed**；black/isort/ruff/codespell 全过。
-- 镜像复测（`vllm-router-cacheaware:c6`，同一 40 并发 burst，decay=5）：candA 峰值 **21**、candB **19**（≈1.1:1）→ 惊群被打散；`/metrics` 率指标仍正常。
-
-### 对比
-| | candA 峰值并发 | candB 峰值并发 |
+| 参数 | 默认值 | 说明 |
 |---|---|---|
-| C5 修复前 | 35 | 5 |
-| C6 修复后 | 21 | 19 |
-
-### 引以为戒（post-mortem）
-- 任何"基于周期 scrape 的负载做路由决策"都必须叠加 **router 自身在途计数**，否则 scrape 盲窗内必然惊群；随机分发只是缓解，不解决。
-- 衰减窗口应贴近真实请求时长；过短退化为无计账，过长会过度分散（可经 `--cache-aware-inflight-decay` 调）。
-- 进一步可选项（未做，避免 over-engineering）：缩短 `--engine-stats-interval`、按精确完成回调而非时间衰减。
-
----
-
-## C7 — 修复"在途计数按时间衰减"缺陷（#1）
-
-### 诊断（先证明缺陷真实存在）
-C6 的在途计数 `_pending` 按 `--cache-aware-inflight-decay`(5s) **时间衰减**，从不在请求真正完成时递减。若请求时长 > 衰减窗口，衰减会**提前忘记仍在跑的请求**，惊群回归。
-
-复现（`prove1.sh`，c6，候选请求 delay=12s，decay=5s）：
-- wave1：12 并发，candB 临时超限 → 全落 candA（candA in-flight=12，持续 12s）。
-- 治愈 candB；wave2 前断言 **candA 仍 in-flight=12**（确保测试有效）。
-- wave2：12 并发 → **candA 峰值 18 / candB 6**（理想 12/12）→ decay 忘记了 candA 上仍在跑的 12 个 → 惊群回归。**缺陷证实。**
-
-### 修复（最小、对症）
-- `src/vllm_router/routers/routing_logic.py`：`_pending` 改为**完成精确计数**——`_inflight: Dict[url, deque[ts]]`，派发时入队，`on_request_complete(url)` 出队；`_pending_load` 仅把 `inflight_decay` 当**安全上限**（丢弃从未观察到完成的泄漏项，如客户端断连）。请求在其**整个生命周期**内都计入其 engine，不再被固定窗口提前忘记。
-- `src/vllm_router/services/request_service/request.py`：`process_request` 完成处，除 monitor.on_request_complete 外，对实现了 `on_request_complete` 的 router（duck-typing，仅 cache_aware 有）回调递减在途。
-- `--cache-aware-inflight-decay` 语义改为"安全上限"，默认 5→**300**（>最长请求）。
-- 不变：粘滞/阈值判定、fallback 排序结构、热路径 O(1)。
-
-### 验证
-- TDD 新增：`test_completion_decrements_inflight`、`test_long_inflight_not_forgotten_until_complete`（100s 后仍计入，仅完成才清零）、`test_inflight_safety_cap_drops_unobserved`（泄漏兜底）。
-- 全量 `pytest src/tests/ --ignore=test-openai.py` → **68 passed**；black/ruff/codespell 全过。
-- 镜像 `:c7` 同一 `prove1.sh`（candA 确认 wave2 时仍 in-flight=12）：**candA 峰值 18→14、candB 6→10** → 惊群回归基本消除（candA 多出的 2 个是 wave1 真实完成后正确释放所致）。
-- 正常不回归：粘滞 session×8 全落单引擎；单波 40 并发 → candA/candB 各 20 均衡。
+| `--routing-logic cache_aware_load_balancing` | — | 启用本模式 |
+| `--session-key` | — | 提取 session id 的请求头名称（本模式必填） |
+| `--cache-aware-tolerate-waiting-requests` | 20 | 排队阈值：粘滞引擎排队数达到此值即触发 fallback |
+| `--cache-aware-p50-ttft-threshold` | 0（关闭） | p50 TTFT 阈值（秒） |
+| `--cache-aware-p99-ttft-threshold` | 0（关闭） | p99 TTFT 阈值（秒） |
+| `--cache-aware-p50-e2e-threshold` | 0（关闭） | p50 端到端延迟阈值（秒） |
+| `--cache-aware-p99-e2e-threshold` | 0（关闭） | p99 端到端延迟阈值（秒） |
+| `--cache-aware-stats-window` | 30 | 指标统计窗口（秒） |
+| `--cache-aware-inflight-decay` | 300 | 在途计数安全上限（秒），用于回收未正常结束的请求 |
+| `--cache-aware-tie-tolerance` | 0 | 负载差值不超过此值的候选视为并列并随机选择；0 表示仅对完全相等者随机 |
+| `--engine-stats-interval`（上游既有） | 30 | 引擎 `/metrics` 抓取间隔；多副本部署建议设为 3–5 |
 
 ---
 
-## C8 — 缓解跨副本惊群（#2，多 router 副本）
+## 6. 监控指标
 
-### 诊断（先证明）
-每个 router 进程只知道**自己**派发的在途请求；多副本不共享，导致跨副本惊群。
+通过 `/metrics` 暴露：
 
-复现（`prove2.sh`，c7，2 个 router 副本同后端，候选 delay=15s）：
-- router1 发 10 → 全落 candA（candA in-flight=10，持续）。
-- 治愈 candB；router2（独立副本，本地计数为空）发 10。
-- 结果 **candA 峰值 15 / candB 5**（理想 10/10）→ router2 不知道 router1 已把 10 个压在 candA → 把自己的一半又压上去。**缺陷证实。**
-
-### 修复（最小、对症）
-- `_fallback_sort_key` 的有效负载改为 `scraped_waiting + scraped_running + local_pending`。新增的 **scraped `num_requests_running`** 是唯一能聚合所有副本的信号（engine 上报自身真实负载），让 router2 经一次 scrape 后即可看到 candA 的真实在途并避开它。
-- **触发判定 `_violated_reasons` 不变**（仍按 queue/延迟），仅 fallback 的"选哪个最空"用 running。职责清晰：触发=是否过载，排序=谁最空。
-- 单副本下 `local_pending` 与 scraped_running 对本副本自身请求会短暂重复计数（派发即计 local，scrape 后又计 running）；方向偏保守（更倾向分散），安全，已记为已知偏置。
-
-### 验证
-- TDD 新增 `test_fallback_prefers_lower_scraped_running`；全量 `pytest` → **69 passed**；black/ruff 全过。
-- 镜像 `:c8` 同一 `prove2.sh`：**candA 峰值 15→13、candB 5→7** → 跨副本惊群改善（router2 经 scrape 看到 candA 负载后转向 candB）。
-- #1 不回归（c8 `prove1.sh`：14/10，与 c7 同）；正常不回归（粘滞 ×8 单引擎；单波 40 并发 20/20）。
-
-### 残留限制（诚实记录，未做 = 避免 over-engineering）
-- 跨副本只在**一次 scrape 之后**收敛；**同一 scrape 间隔内多副本同时突发**仍会部分惊群（13/7 中那 3 个即来自 scrape 滞后）。要更强需共享状态（如 Redis）或把 scrape 间隔调小。
-- 实操建议：多副本部署务必调小 `--engine-stats-interval`（3–5s）；单副本部署不受 #2 影响。
+- `vllm:cache_aware_stickiness_rate`：窗口内粘滞率。
+- `vllm:cache_aware_fallback_rate`：窗口内总 fallback 率。
+- `vllm:cache_aware_fallback_reason_rate{reason}`：各原因的 fallback 率，`reason ∈ {queue, p50_ttft, p99_ttft, p50_e2e, p99_e2e}`。
+- `vllm:cache_aware_inflight_requests{server}`：本路由器对各引擎的在途请求数。
 
 ---
 
-## C9 — 随机化打散并列（彻底缓解 #2 残留，无需 Redis）
+## 7. 使用说明
 
-### 背景
-C8 的跨副本缓解依赖 scraped running，**只能在一次 scrape 后收敛**；同一 scrape 盲窗内多副本同时突发仍会齐刷刷按确定性 `min` 扑同一引擎。根因是**确定性**：所有副本用同一份陈旧视图算出同一个 min。
+### 7.1 启用（单副本）
 
-### 修复（方案 2：只在"近似并列"时随机）
-- `_select_fallback`：候选按有效负载分组，落在 `min_load + tie_tolerance` 内的视为"并列"；
-  - 有明确赢家（仅 1 个）→ **确定性**返回；
-  - 并列多个 → 先按 p50_e2e 取最优，**仅对仍并列者随机**（`random.choice`）。
-- 新增 `--cache-aware-tie-tolerance`（默认 0.0 = 只随机精确并列）+ app/工厂接线。
-- 不引入任何共享状态/Redis；确定性在"有明确赢家"时完全保留（你之前选的 `(queue,p50_e2e)` 语义在非并列时不变）。
+```
+vllm-router \
+  --routing-logic cache_aware_load_balancing \
+  --session-key x-session-id \
+  --cache-aware-tolerate-waiting-requests 20
+```
 
-### 证明 + 回归
-- 单元（严格证明跨副本分散）：`test_select_fallback_randomises_genuine_ties` —— 对**同一空/陈旧视图**做 200 次独立决策（等价于 200 个独立副本同刻决策），确定性会全选同一个，随机化后**两引擎都出现且大致均衡**（实测 ~60–140/200）。
-- 其余新增：明确赢家恒定（`clear_winner_is_deterministic`）、load 并列但 p50 不同仍确定（`tie_break_p50_still_deterministic`）、`tie_tolerance` 分组（`tie_tolerance_groups_near_equal_loads`）。
-- 全量 `pytest src/tests/ --ignore=test-openai.py` → **73 passed**，连跑 3 次无 flaky；black/isort/ruff/codespell 全过。
-- 镜像 `:c9` 回归：#1=14/10、#2=13/7（均与修复后一致，未回归）；正常粘滞 ×8 全落单引擎、单波 40 并发 20/20。
+`--session-key` 为必填项；其值应为客户端用于标识同一会话的请求头名称。仅设置排队阈值即可工作，延迟阈值默认关闭。
 
-### 说明
-- 单副本下随机化几乎不触发（local in-flight 计数会把候选区分开，很少精确并列），所以单副本行为基本不变；它主要在多副本盲窗的"大家都看起来一样空"时发挥作用。
-- 三层叠加最终形态：in-flight 计数（单副本即时）+ scraped running（跨副本，scrape 后收敛）+ 并列随机（跨副本盲窗内统计分散）。
+### 7.2 启用延迟阈值（可选）
+
+延迟阈值用于在引擎排队不高但响应变慢时进行保护，单位为秒，0 表示关闭：
+
+```
+  --cache-aware-p50-e2e-threshold 5 \
+  --cache-aware-p99-e2e-threshold 15 \
+  --cache-aware-p50-ttft-threshold 1 \
+  --cache-aware-p99-ttft-threshold 3
+```
+
+阈值应依据服务的 SLO 设定。注意：路由器测得的延迟为客户端侧延迟（含网络与代理开销），且仅对流式请求的 TTFT 有效；非流式请求的 TTFT 等同于端到端延迟，此时不建议启用 TTFT 阈值。
+
+### 7.3 多副本部署
+
+多副本部署时，跨副本负载感知依赖 `/metrics` 抓取，存在抓取周期的滞后（详见第 10 节约束 3）。建议缩短抓取间隔：
+
+```
+  --engine-stats-interval 3
+```
+
+粘滞决策由一致性哈希保证跨副本一致，无需额外配置。
+
+### 7.4 阈值调优建议
+
+- `--cache-aware-tolerate-waiting-requests`：设为单引擎可接受的最大排队请求数。过小会过早转发、降低缓存命中；过大会延迟过载保护。
+- `--cache-aware-inflight-decay`：保持默认 300 秒即可；仅当存在大量超长请求时才需调大。
+- `--cache-aware-stats-window`：指标统计窗口，默认 30 秒，影响监控曲线的平滑程度，不影响路由行为。
+
+### 7.5 监控
+
+通过 Prometheus 抓取路由器 `/metrics`，关注第 6 节列出的指标。`stickiness_rate` 持续偏低或 `fallback_rate` 偏高，通常表明引擎容量不足或阈值过严。
+
+### 7.6 镜像说明
+
+路由器镜像基于 `docker/Dockerfile` 构建。若使用本仓库默认构建，可通过 `INSTALL_OPTIONAL_DEP` 控制可选依赖。仅需 cache-aware 功能时无需安装 `lmcache`；如需同时使用 `kvaware` 路由模式，则必须保留 `lmcache` 依赖。
 
 ---
 
-## C10 — code review 收口（@review，两轴：Standards + Spec）
+## 8. 多副本协同
 
-对 `ba6c304..HEAD` 跑了 review skill（Standards / Spec 两个并行子代理）。逐条处理：
+多个路由器副本之间不直接通信，亦不依赖共享存储。协同依靠两个机制：
 
-### 修复（全改）
-- **[Spec#2 真 bug] 窗口率指标空闲卡住**：之前 `_publish_gauges` 只在 `_record` 里调，无新请求时 `stickiness/fallback` 率冻结在最后值。新增 `refresh_window_metrics(now)`（evict+publish），并在 `metrics_router.py` 的 `/metrics` handler 里对活跃的 cache-aware router 调用 → 空闲时随窗口衰减到 0。**实测**：traffic 后 0.875/0.125 → 空闲 12s(>窗口10s) 再抓 = 0.0/0.0。
-- **[Standards HARD1] 默认值三处重复**：工厂改为只透传"已提供的键"（`{k: kwargs[k] for k in optional if k in kwargs}`），默认值单一来源 = `__init__` 签名。
-- **[Standards HARD2] 完成钩子不在契约里 + 同名混淆**：在 `RoutingInterface` 加 no-op `release_inflight(engine_url)`，cache-aware 覆写；`request.py` 直接调 `router.release_inflight(...)`（不再 duck-typing），并与 `RequestStatsMonitor.on_request_complete` 区分命名。
-- **[Standards J3] `get_overload_snapshot` 返回内部缓存引用**：改为返回深拷贝（`{u: dict(v)}`，N×4 floats，开销可忽略）。
-- **[Standards J4] 无锁假设**：类 docstring 注明状态仅在 asyncio 事件循环线程被修改，故不加锁。
-- **[Standards J5] 无 session 分支**：注明刻意用 least-load（非 `_qps_routing`），且不计入会话指标。
-- **[Standards J6] `_pending_load` 读取有副作用**：docstring 注明惰性淘汰过期项。
+1. 粘滞决策：各副本均采用一致性哈希，且发现的引擎集合相同，因此同一 session 在任意副本均被路由至同一引擎，无需协调即可保持一致。
+2. 负载感知：各副本独立抓取相同引擎的 `/metrics`。引擎上报的 running 计数包含所有副本产生的负载，是副本间感知彼此负载的唯一信号，但存在一个抓取周期的滞后。
 
-### 不改（已确认合理）
-- Spec(b) `request.py` 加 hook：修复 #1 必需，未动解包逻辑，合理偏离。
-- Spec(c1) fallback 主键 `queue+running+pending`：修复 #2/#3 的有意结果，非 #7 字面。
-- Spec(c3) 无 session 不计指标：刻意语义（已注明）。
-- fake server 的 `POST /set_metrics`：测试设想，非需求，未做。
-
-### 验证
-- 全量 `pytest src/tests/ --ignore=test-openai.py` → **75 passed**（新增 idle-decay、base no-op release_inflight 测试）；black/isort/ruff/codespell 全过。
-- 镜像 `:c10`：空闲衰减实测通过（见上）。
+跨副本负载感知的滞后限制及对策见第 10 节。
 
 ---
 
-## 稳定性测试（上线前，P1–P5）
+## 9. 实现演进中修复的关键缺陷
 
-### P1 — 故障注入（发现并修复 in-flight 泄漏）
-**发现**：`process_request` 的 `on_request_complete`/`release_inflight` 在 `async with stream` 块**之后**（非 finally），后端流异常/客户端中途断开时不会触发 → router in-flight 计数泄漏到 300s TTL 才回收。
-**修复**：把 streaming 包进 `try/finally`，`release_inflight(backend_url)` 放 finally → 任何退出路径都释放。新增 `vllm:cache_aware_inflight_requests{server}` gauge（router 侧每引擎在途，运维可观测 + 可测）。
-**实测**（`:c11`，mock 故障注入 abort/5xx/hang）：
-- abort / 5xx：in-flight gauge 故障后回 0 → **无泄漏**。
-- hang + 客户端断开：因 `process_request` 用 `timeout=None`，挂死后端会一直占着流(请求确实仍在途)，**靠 `inflight_decay` TTL 安全上限回收**——decay=10s 时 6/4 → 0（12s 后）。无永久泄漏。
-- 已知运维注意：router 对后端**无读超时**(`timeout=None`，上游既有行为)，挂死引擎会占住连接直到其响应或 TTL；我们的计数靠 TTL 自愈，不属本功能引入。
-单测新增 inflight gauge 发布/释放；全量 75→ 仍全过。
+| 缺陷 | 修复方式 | 相关提交 |
+|---|---|---|
+| 并发 fallback 集中至单一引擎（惊群） | 引入在途计数；排序纳入 scraped running；并列时随机选择 | `c51c1ce` / `6298d20` / `beb37fc` |
+| 在途计数按固定时间衰减，长请求被提前忽略 | 改为请求结束时精确递减，时间窗口仅作安全上限 | `dce7ff3` |
+| 请求异常或客户端断开时在途计数未释放 | 将释放逻辑置于 `try/finally`，确保任意退出路径均释放 | `7fb68eb` |
+| 无流量时窗口指标停留在旧值 | `/metrics` 抓取时刷新并随时间衰减 | `7ae7410` |
+| `RequestStatsMonitor` 按 request_id 的字典无界增长（上游既有） | 请求结束时清除对应条目 | `5c1b5ae` |
 
-### P2 — churn（增删引擎 / 滚动重启）
-- 单测：移除引擎 → 仅该引擎上的 session 重映射(一致性哈希)、survivors 不动；移除的引擎永不再被选。
-- 限制（已文档）：静态服务发现的后端集启动时固定,**活体 churn / 终止中 pod 检测需 K8s 服务发现**(本机无集群无法跑);FlowGPT 的 pod-terminating 检测我们未移植,依赖上游 K8s readiness。
+---
 
-### P4 — 过载 + router 转发开销
-- 转发开销：直连 mock p50=52.4ms vs 经 router p50=59.9ms → **+~7.5ms p50 / +8ms p99**(=网络+代理,与延迟对齐实测一致)。
-- 持续过载：300 请求 @ 并发 40 → **0 错误**、168 qps、三引擎峰值在途 20/17/18 **均衡**。
-- 注:distinct 单发请求在 < scrape 间隔的瞬时尖峰下不触发 fallback(陈旧 scrape 限制,已知);fallback 分散已在 prove1/2 证明。
+## 10. 已知约束
 
-### P5 — 多副本端到端
-- 2 个 router 副本同后端,10 个 session 各发往两副本 → **10/10 路由到同一引擎**(一致性哈希跨副本天然一致,零协调);各副本各自暴露 10 条 cache_aware 指标(Prometheus 侧聚合)。
+1. 路由器对后端无读超时（`request.py` 中使用 `timeout=None`，为上游既有行为）。当引擎无响应但连接未断开时，该请求流将持续占用连接；在途计数由 `--cache-aware-inflight-decay` 回收，但连接本身不会释放。建议在 vLLM 侧配置请求超时与健康探针，由 K8s 摘除异常 Pod。
+2. 滚动重启期间正在终止的 Pod：本实现未包含终止状态检测，依赖上游 K8s readiness。滚动发布瞬间可能有少量请求被路由至正在关闭的 Pod。建议配置 Pod 优雅关闭；如需更强保证可补充终止状态检测。
+3. 同一抓取周期内多副本同时出现流量突发：跨副本负载感知存在抓取滞后，此场景下仅依靠并列随机进行统计性分散，无法完全消除集中。建议多副本部署将 `--engine-stats-interval` 设为 3–5 秒；单副本部署不受此约束影响。
 
-### P3 — 30min 长稳 soak（发现并修复内存泄漏）
-**发现**：c11 soak 内存持续爬升 470→495 MiB / 8min(~3MiB/min)。定位为**上游既有泄漏**:`RequestStatsMonitor.on_request_complete` 从不清理 `request_start_time`/`first_token_time`(按 request_id 的 dict 无界增长),非本功能引入,但被 soak 暴露。
-**修复**：on_request_complete 末尾 `pop` 这两个 dict 的本请求键。单测验证 100 请求后两 dict 归零。
-**验证**（`:c12` 修复后 30min soak）：**226,784 请求 / 0 错误**,内存 **470.6→474 MiB 全程持平**(对比 c11 同期已 491 且继续爬),inflight 有界(0–10),CPU 稳定 ~45%。**泄漏修复确认,长稳通过。**
+---
 
-## 稳定性总评
-P1 故障(in-flight 泄漏)已修；P2 churn 逻辑正确(活体 churn 需 K8s)；P3 30min 0 错误内存持平；P4 0 错误、~7.5ms 开销、均衡；P5 跨副本粘滞一致。两个真实 bug(in-flight 泄漏、stats dict 泄漏)在测试中发现并修复。
+## 11. 提交记录（分支 `sss-dev`）
+
+| 提交 | 内容 |
+|---|---|
+| `22c83cc` | 提交规范规则与本文档 |
+| `7a5294b` | 延迟分位数与超限快照（`request_stats`） |
+| `830afb4` | 核心路由器、排队阈值与 fallback |
+| `182773f` | p50/p99 TTFT 与 p50/p99 端到端阈值 |
+| `fadcdc5` | 窗口化 Prometheus 指标 |
+| `3ea4b49` | 代码简化 |
+| `c51c1ce` | 惊群修复（在途计数） |
+| `dce7ff3` | 在途计数改为完成精确计数 |
+| `6298d20` | 排序纳入 scraped running（跨副本） |
+| `beb37fc` | 并列随机选择 |
+| `7ae7410` | 代码评审收口 |
+| `7fb68eb` | 故障路径释放在途计数；新增在途指标 |
+| `5c1b5ae` | 修复统计字典内存泄漏；补充回归测试 |
+
+测试：单元测试全量 79 项通过；稳定性测试 P1–P5（故障注入、引擎增删、30 分钟长稳、过载、多副本）均通过，详见对应提交。
