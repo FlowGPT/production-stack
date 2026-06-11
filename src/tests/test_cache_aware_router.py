@@ -56,13 +56,51 @@ def _stats(queues):
 def test_violated_reasons_queue():
     r = _fresh_router(tolerate_waiting_requests=5)
     es = _stats({"http://e1": 5, "http://e2": 4})
-    assert r._violated_reasons("http://e1", es, {}) == ["queue"]
-    assert r._violated_reasons("http://e2", es, {}) == []
+    assert r._violated_reasons("http://e1", es, {}, now=1000.0) == ["queue"]
+    assert r._violated_reasons("http://e2", es, {}, now=1000.0) == []
+
+
+def test_violated_reasons_instant_queue_disabled_by_default():
+    # engine_max_concurrency=0 (default) -> in-flight never trips the queue trigger.
+    r = _fresh_router(tolerate_waiting_requests=5)
+    es = {"http://e1": EngineStats(num_queuing_requests=0, num_running_requests=0)}
+    for _ in range(50):
+        r._record_dispatch(1000.0, "http://e1")
+    assert r._violated_reasons("http://e1", es, {}, now=1000.0) == []
+
+
+def test_violated_reasons_instant_queue_boundary():
+    # capacity=8, tolerate=5 -> exact trip point is inflight 13 (13 - 8 = 5),
+    # even while the scrape still shows queue/running 0.
+    r = _fresh_router(tolerate_waiting_requests=5, engine_max_concurrency=8)
+    es = {"http://e1": EngineStats(num_queuing_requests=0, num_running_requests=0)}
+    for _ in range(12):  # 12 - 8 = 4 < 5 -> not yet
+        r._record_dispatch(1000.0, "http://e1")
+    assert r._violated_reasons("http://e1", es, {}, now=1000.0) == []
+    r._record_dispatch(1000.0, "http://e1")  # 13 - 8 = 5 >= 5 -> trips
+    assert "queue" in r._violated_reasons("http://e1", es, {}, now=1000.0)
+
+
+def test_violated_reasons_instant_queue_high_capacity_not_falsely_flagged():
+    # A high-concurrency engine must NOT be flagged by a moderate burst.
+    r = _fresh_router(tolerate_waiting_requests=5, engine_max_concurrency=1000)
+    es = {"http://e1": EngineStats(num_queuing_requests=0, num_running_requests=0)}
+    for _ in range(40):
+        r._record_dispatch(1000.0, "http://e1")
+    assert r._violated_reasons("http://e1", es, {}, now=1000.0) == []
+
+
+def test_violated_reasons_scraped_queue_dominates_low_inflight():
+    # max() merge: scraped queue alone trips even when in-flight is below capacity.
+    r = _fresh_router(tolerate_waiting_requests=5, engine_max_concurrency=8)
+    es = {"http://e1": EngineStats(num_queuing_requests=6, num_running_requests=8)}
+    r._record_dispatch(1000.0, "http://e1")  # inflight 1 - 8 < 0, ignored
+    assert "queue" in r._violated_reasons("http://e1", es, {}, now=1000.0)
 
 
 def test_violated_reasons_unknown_engine():
     r = _fresh_router(tolerate_waiting_requests=5)
-    assert r._violated_reasons("http://missing", {}, {}) == []
+    assert r._violated_reasons("http://missing", {}, {}, now=1000.0) == []
 
 
 def test_select_fallback_excludes_overloaded_picks_min_queue():
@@ -179,21 +217,21 @@ def test_violated_reasons_latency_thresholds():
     )
     es = _stats({"http://e1": 0})
     over = {"http://e1": _snap(p50_ttft=3.0, p99_ttft=6.0, p50_e2e=9.0, p99_e2e=25.0)}
-    assert set(r._violated_reasons("http://e1", es, over)) == {
+    assert set(r._violated_reasons("http://e1", es, over, now=1000.0)) == {
         "p50_ttft",
         "p99_ttft",
         "p50_e2e",
         "p99_e2e",
     }
     under = {"http://e1": _snap(p50_ttft=1.0, p99_ttft=4.0, p50_e2e=7.0, p99_e2e=19.0)}
-    assert r._violated_reasons("http://e1", es, under) == []
+    assert r._violated_reasons("http://e1", es, under, now=1000.0) == []
 
 
 def test_violated_reasons_queue_and_latency_combined():
     r = _fresh_router(tolerate_waiting_requests=5, p99_e2e_threshold=10.0)
     es = _stats({"http://e1": 9})
     snap = {"http://e1": _snap(p99_e2e=15.0)}
-    reasons = r._violated_reasons("http://e1", es, snap)
+    reasons = r._violated_reasons("http://e1", es, snap, now=1000.0)
     assert reasons[0] == "queue"
     assert "p99_e2e" in reasons
 
@@ -202,7 +240,7 @@ def test_threshold_disabled_when_zero():
     r = _fresh_router(tolerate_waiting_requests=5, p50_ttft_threshold=0.0)
     es = _stats({"http://e1": 0})
     snap = {"http://e1": _snap(p50_ttft=999.0)}
-    assert r._violated_reasons("http://e1", es, snap) == []
+    assert r._violated_reasons("http://e1", es, snap, now=1000.0) == []
 
 
 def test_latency_no_data_does_not_trigger():
@@ -210,7 +248,7 @@ def test_latency_no_data_does_not_trigger():
     es = _stats({"http://e1": 0})
     # snapshot reports -1 (no completed requests) -> must not fall back
     snap = {"http://e1": _snap(p50_e2e=-1)}
-    assert r._violated_reasons("http://e1", es, snap) == []
+    assert r._violated_reasons("http://e1", es, snap, now=1000.0) == []
 
 
 def test_route_request_fallback_on_latency_threshold():
@@ -493,6 +531,39 @@ def test_route_records_dispatch_for_chosen_engine():
     chosen = r._route_with_snapshot(eps, es, req, {}, now=now)
     assert r._pending_load(chosen, now) == 1
     assert chosen == initial  # under threshold -> sticky, still recorded
+
+
+def _burst_same_session(engine_max_concurrency, n):
+    # Simulate n concurrent same-session requests arriving before any completes
+    # and before the engine-stats scrape updates (scraped queue stays 0). Returns
+    # (sticky_inflight, other_inflight) after the burst.
+    r = _fresh_router(
+        tolerate_waiting_requests=5, engine_max_concurrency=engine_max_concurrency
+    )
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2")]
+    r._update_hash_ring(eps)
+    initial = r.hash_ring.get_node("burst")
+    other = "http://e2" if initial == "http://e1" else "http://e1"
+    es = _stats({u: 0 for u in ("http://e1", "http://e2")})  # stale: scrape sees 0
+    req = FakeRequest({"session_id": "burst"})
+    for _ in range(n):
+        r._route_with_snapshot(eps, es, req, {}, now=1000.0)
+    return r._pending_load(initial, 1000.0), r._pending_load(other, 1000.0)
+
+
+def test_burst_overflows_sticky_without_capacity():
+    # Regression baseline: with the estimate disabled the stale scrape never
+    # trips the queue trigger, so the whole burst herds onto the sticky engine.
+    sticky, other = _burst_same_session(engine_max_concurrency=0, n=26)
+    assert (sticky, other) == (26, 0)
+
+
+def test_burst_disperses_with_capacity():
+    # Fix: capacity-based instant queue caps each engine at capacity + tolerate
+    # (8 + 5 = 13), so a 26-request burst splits evenly instead of herding.
+    sticky, other = _burst_same_session(engine_max_concurrency=8, n=26)
+    assert sticky == 13
+    assert other == 13
 
 
 # --- Returning-session request funnel: first visit vs returning ---

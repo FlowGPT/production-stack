@@ -264,8 +264,11 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     queue length first, ties broken by the lower p50 e2e latency.
 
     Overload is decided by per-engine thresholds; this layer wires the queue
-    threshold (``tolerate_waiting_requests``). Latency percentile thresholds are
-    added on top of the same ``_violated_reasons`` seam.
+    threshold (``tolerate_waiting_requests``). When ``engine_max_concurrency`` is
+    set, the queue signal also includes an instant estimate from this router's
+    in-flight count (requests beyond engine capacity), so a burst triggers
+    fallback before the periodic engine-stats scrape reports the queue. Latency
+    percentile thresholds are added on top of the same ``_violated_reasons`` seam.
 
     Concurrency: the mutable state (the window deque/counters, the in-flight
     map, and the in-memory returning-session store) is only mutated from the
@@ -289,6 +292,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         stats_window: float = 30.0,
         inflight_decay: float = 300.0,
         tie_tolerance: float = 0.0,
+        engine_max_concurrency: int = 0,
         returning_session_ttl: float = 3600.0,
         returning_session_store: Optional[ReturningSessionStore] = None,
     ):
@@ -303,6 +307,12 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         # Engines within this load gap of the best are treated as tied and the
         # choice among them is randomised (breaks cross-replica herding).
         self.tie_tolerance = tie_tolerance
+        # Per-engine concurrency limit (= vLLM --max-num-seqs). When > 0, the
+        # queue trigger also uses an instant estimate of the queue from this
+        # router's in-flight count (requests beyond this capacity are assumed
+        # queued), so a burst is caught before the periodic scrape reports it.
+        # 0 disables the estimate -> trigger uses only the scraped queue.
+        self.engine_max_concurrency = engine_max_concurrency
         # Latency percentile thresholds in seconds; <= 0 disables that check.
         # (snapshot_key, threshold) pairs evaluated in _violated_reasons.
         self.latency_thresholds = {
@@ -386,16 +396,25 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         url: str,
         engine_stats: Dict[str, EngineStats],
         snapshot: Dict[str, Dict[str, float]],
+        now: float,
     ) -> List[str]:
         """Return the threshold names ``url`` currently violates (empty if OK)."""
         reasons: List[str] = []
         stats = engine_stats.get(url)
-        if (
-            stats is not None
-            and self.tolerate_waiting_requests > 0
-            and stats.num_queuing_requests >= self.tolerate_waiting_requests
-        ):
-            reasons.append("queue")
+        if stats is not None and self.tolerate_waiting_requests > 0:
+            queue_signal = stats.num_queuing_requests
+            if self.engine_max_concurrency > 0:
+                # Instant queue estimate: this router's in-flight requests beyond
+                # the engine's concurrency limit are assumed to be queued, even
+                # if the (stale) scrape has not reported them yet. Capacity-based
+                # so a high-concurrency engine is not falsely flagged during a
+                # burst. Disabled (0) -> only the scraped queue is used.
+                instant_queue = (
+                    self._pending_load(url, now) - self.engine_max_concurrency
+                )
+                queue_signal = max(queue_signal, instant_queue)
+            if queue_signal >= self.tolerate_waiting_requests:
+                reasons.append("queue")
         engine_snapshot = snapshot.get(url, {})
         for key, threshold in self.latency_thresholds.items():
             if threshold > 0:
@@ -437,7 +456,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         candidates = [
             e.url
             for e in endpoints
-            if not self._violated_reasons(e.url, engine_stats, snapshot)
+            if not self._violated_reasons(e.url, engine_stats, snapshot, now)
         ]
         if not candidates:
             # Every engine is overloaded: keep KV cache affinity.
@@ -511,7 +530,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             session_id, now, self.returning_session_ttl
         )
         initial_url = self.hash_ring.get_node(session_id)
-        reasons = self._violated_reasons(initial_url, engine_stats, snapshot)
+        reasons = self._violated_reasons(initial_url, engine_stats, snapshot, now)
         if not reasons:
             self._record(now, False, [], is_returning)
             self._record_dispatch(now, initial_url)
@@ -964,6 +983,7 @@ def initialize_routing_logic(
             "stats_window",
             "inflight_decay",
             "tie_tolerance",
+            "engine_max_concurrency",
             "returning_session_ttl",
         )
         router_kwargs = {k: kwargs[k] for k in optional if k in kwargs}

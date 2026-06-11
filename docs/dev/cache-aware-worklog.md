@@ -60,7 +60,7 @@
 1. 请求未携带 session：选择有效负载最小的引擎并返回（线上请求均携带 session，此分支为防御性处理）。
 2. 请求携带 session：通过一致性哈希计算其归属引擎 `initial`。
 3. 判定 `initial` 是否过载（`_violated_reasons`），命中以下任一条件即视为过载：
-   - 排队请求数 ≥ `--cache-aware-tolerate-waiting-requests`；
+   - 排队请求数 ≥ `--cache-aware-tolerate-waiting-requests`（启用 `--cache-aware-engine-max-concurrency` 时，队列信号取 scrape 排队数与「in-flight 超出容量部分」的较大值，突发时更早触发）；
    - p50 / p99 TTFT ≥ 对应阈值；
    - p50 / p99 端到端延迟 ≥ 对应阈值；
    - 阈值为 0 表示该项关闭，不参与判定。
@@ -114,6 +114,7 @@
 | `--routing-logic cache_aware_load_balancing` | — | 启用本模式 |
 | `--session-key` | — | 提取 session id 的请求头名称（本模式必填） |
 | `--cache-aware-tolerate-waiting-requests` | 20 | 排队阈值：粘滞引擎排队数达到此值即触发 fallback |
+| `--cache-aware-engine-max-concurrency` | 0（关闭） | 单引擎并发上限（= vLLM `--max-num-seqs`）。>0 时，把本路由器对该引擎的 in-flight 中**超过此容量**的部分也当作排队计入队列信号，从而在周期 scrape 反映队列前就触发 fallback；0 表示只用 scrape 到的排队数 |
 | `--cache-aware-p50-ttft-threshold` | 0（关闭） | p50 TTFT 阈值（秒） |
 | `--cache-aware-p99-ttft-threshold` | 0（关闭） | p99 TTFT 阈值（秒） |
 | `--cache-aware-p50-e2e-threshold` | 0（关闭） | p50 端到端延迟阈值（秒） |

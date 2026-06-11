@@ -241,6 +241,18 @@ def parse_args():
         "expected request. Default 300.",
     )
     parser.add_argument(
+        "--cache-aware-engine-max-concurrency",
+        type=int,
+        default=0,
+        help="cache_aware_load_balancing: per-engine concurrency limit "
+        "(set to vLLM --max-num-seqs). When > 0, the queue trigger also counts "
+        "this router's in-flight requests beyond this capacity as queued, so a "
+        "burst triggers fallback before the periodic engine-stats scrape "
+        "reports the queue. 0 disables this estimate (queue uses only the "
+        "scraped queueing-requests count). Assumes all engines share this "
+        "concurrency limit. Default 0.",
+    )
+    parser.add_argument(
         "--cache-aware-tie-tolerance",
         type=float,
         default=0.0,
