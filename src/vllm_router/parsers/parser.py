@@ -90,6 +90,15 @@ def validate_args(args):
             "Session key must be provided when using cache_aware_load_balancing "
             "routing logic."
         )
+    if (
+        args.routing_logic == "cache_aware_load_balancing"
+        and args.cache_aware_returning_session_store == "redis"
+        and not args.cache_aware_returning_session_redis_url
+    ):
+        raise ValueError(
+            "--cache-aware-returning-session-redis-url must be provided when "
+            "--cache-aware-returning-session-store=redis."
+        )
     if args.log_stats and args.log_stats_interval <= 0:
         raise ValueError("Log stats interval must be greater than 0.")
     if args.engine_stats_interval <= 0:
@@ -240,6 +249,67 @@ def parse_args():
         "cross-replica fallback herding (independent router replicas with the "
         "same stale view pick different engines) without shared state. Default 0 "
         "(randomise only exact ties).",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-ttl",
+        type=float,
+        default=3600.0,
+        help="cache_aware_load_balancing: seconds to remember a session id as "
+        "'seen' for the returning-session metrics. A session's first request "
+        "within this window is a first visit; later ones are 'returning'. Only "
+        "affects cache_aware_returning_* / cache_aware_first_visit_* metrics, "
+        "not routing. Default 3600.",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-store",
+        type=str,
+        default="memory",
+        choices=["memory", "redis"],
+        help="cache_aware_load_balancing: backend for returning-session "
+        "recognition. 'memory' (default) is per-replica; 'redis' shares the "
+        "seen-state across all router replicas so returning metrics are correct "
+        "in multi-replica deployments. Routing is unaffected either way.",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-redis-url",
+        type=str,
+        default=None,
+        help="cache_aware_load_balancing: Redis URL (e.g. "
+        "redis://host:6379/0) used when "
+        "--cache-aware-returning-session-store=redis. Required for that mode.",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-redis-key-prefix",
+        type=str,
+        default="vllm:returning-session:",
+        help="cache_aware_load_balancing: key prefix for returning-session "
+        "entries in Redis. Default 'vllm:returning-session:'.",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-redis-timeout",
+        type=float,
+        default=0.05,
+        help="cache_aware_load_balancing: per-call Redis socket timeout "
+        "(seconds) for returning-session lookups. On timeout the visit fails "
+        "open (counted as a first visit). Default 0.05.",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-max-size",
+        type=int,
+        default=0,
+        help="cache_aware_load_balancing: LRU cap on the in-memory "
+        "returning-session store (store=memory). 0 = unbounded (TTL eviction "
+        "only). Bound this if unique-session cardinality is very high. Default 0.",
+    )
+    parser.add_argument(
+        "--cache-aware-returning-session-local-cache-size",
+        type=int,
+        default=0,
+        help="cache_aware_load_balancing: when store=redis, front Redis with a "
+        "per-replica LRU of this many returning session ids to skip the Redis "
+        "round-trip for sessions that keep hitting the same replica (LB "
+        "affinity). Redis stays authoritative for cross-replica first contact. "
+        "0 = disabled. Default 0.",
     )
     parser.add_argument(
         "--lmcache-controller-port",

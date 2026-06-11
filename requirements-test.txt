@@ -1,5 +1,7 @@
 faiss-cpu>=1.7.4
+fakeredis>=2.20.0
 huggingface-hub==0.25.2
 pytest
 pytest-asyncio
+redis>=5.0.0
 sentence-transformers>=2.2.2

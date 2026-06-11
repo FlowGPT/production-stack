@@ -23,7 +23,9 @@
 - 同一会话默认固定路由到同一引擎，以提升 KV cache 命中率。
 - 当目标引擎过载（排队或延迟超过阈值）时，将该次请求转发至满足约束的其他引擎。
 - 提供窗口化的 Prometheus 指标用于观测粘滞率与转发率。
-- 对请求热路径的性能影响接近于零。
+- 核心路由对请求热路径的性能影响接近于零（纯内存计数）。
+
+> 回访会话指标（`cache_aware_returning_*` / `cache_aware_first_visit_*`）为**独立功能**，详见 [cache-aware-returning-session.md](cache-aware-returning-session.md)。其 `memory` 后端仅多一次内存查表；`redis` 后端会在热路径上多一次 Redis 往返（受 socket 超时上限约束），不属于本文上面「接近于零」的范畴。
 
 ---
 
@@ -38,6 +40,7 @@
 | `src/vllm_router/services/request_service/request.py` | 请求代理；请求结束时通知路由器释放在途计数 |
 | `src/vllm_router/parsers/parser.py` | `--cache-aware-*` 命令行参数定义 |
 | `src/vllm_router/app.py` | 参数装配，初始化路由器 |
+| `src/vllm_router/routers/returning_session_store.py` | 回访会话识别后端（memory / redis），见独立文档 |
 
 `CacheAwareLoadBalancingRouter` 的主要方法：
 
@@ -95,7 +98,7 @@
 
 ### 4.3 窗口指标
 
-路由器维护一个 `--cache-aware-stats-window`（默认 30 秒）时间窗口内的决策事件队列，每条记录包含时间戳、是否 fallback、触发原因。
+路由器维护一个 `--cache-aware-stats-window`（默认 30 秒）时间窗口内的决策事件队列，每条记录包含时间戳、是否 fallback、触发原因、是否回访（`is_returning`，供回访会话漏斗指标使用，见独立文档）。
 
 - `_record` 追加事件并更新计数；`_evict` 清除过期事件；`_publish_gauges` 将比率写入 Gauge。
 - `refresh_window_metrics` 在 `/metrics` 被抓取时调用，确保在无流量期间比率仍随时间衰减，而非停留在最后一次记录的值。
@@ -138,6 +141,8 @@
 - `vllm:cache_aware_fallback_reason_total{reason}`：各原因触发 fallback 的累计次数。
 
 第 6 节中以 `_rate` 结尾的 Gauge 为窗口内即时比率，便于直接观察；上述以 `_total` 结尾的 Counter 为累积量，便于在 Grafana 中自定义统计窗口。
+
+回访会话漏斗指标（`cache_aware_first_visit_*` / `cache_aware_returning_*`，区分「新请求 / 回访请求」及回访子集的粘滞率）为独立功能，定义与用法见 [cache-aware-returning-session.md](cache-aware-returning-session.md)。
 
 ### 6.1 日志
 

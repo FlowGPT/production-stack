@@ -103,6 +103,16 @@ async def lifespan(app: FastAPI):
         logger.info("Closing dynamic config watcher")
         dyn_cfg_watcher.close()
 
+    # Release the returning-session store (e.g. Redis connections). No-op on
+    # routers that do not own one.
+    try:
+        router = get_routing_logic()
+    except ValueError:
+        router = None
+    if router is not None:
+        logger.info("Closing returning-session store")
+        router.close_returning_session_store()
+
 
 def initialize_all(app: FastAPI, args):
     """
@@ -191,6 +201,17 @@ def initialize_all(app: FastAPI, args):
         stats_window=args.cache_aware_stats_window,
         inflight_decay=args.cache_aware_inflight_decay,
         tie_tolerance=args.cache_aware_tie_tolerance,
+        returning_session_ttl=args.cache_aware_returning_session_ttl,
+        returning_session_store_type=args.cache_aware_returning_session_store,
+        returning_session_redis_url=args.cache_aware_returning_session_redis_url,
+        returning_session_redis_key_prefix=(
+            args.cache_aware_returning_session_redis_key_prefix
+        ),
+        returning_session_redis_timeout=args.cache_aware_returning_session_redis_timeout,
+        returning_session_max_size=args.cache_aware_returning_session_max_size,
+        returning_session_local_cache_size=(
+            args.cache_aware_returning_session_local_cache_size
+        ),
         lmcache_controller_port=args.lmcache_controller_port,
         prefill_model_labels=args.prefill_model_labels,
         decode_model_labels=args.decode_model_labels,

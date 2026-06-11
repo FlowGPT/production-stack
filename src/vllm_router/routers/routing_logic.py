@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from collections import Counter, deque
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from fastapi import Request
 
@@ -41,13 +41,27 @@ except ImportError:
 from uhashring import HashRing
 
 from vllm_router.log import init_logger
+from vllm_router.routers.returning_session_store import (
+    ReturningSessionStore,
+    create_returning_session_store,
+)
 from vllm_router.service_discovery import EndpointInfo
 from vllm_router.services.metrics_service import (
     cache_aware_fallback_rate,
     cache_aware_fallback_reason_rate,
     cache_aware_fallback_reason_total,
     cache_aware_fallback_total,
+    cache_aware_first_visit_fallback_total,
+    cache_aware_first_visit_request_ratio,
+    cache_aware_first_visit_routed_total,
+    cache_aware_first_visit_sticky_total,
     cache_aware_inflight_requests,
+    cache_aware_returning_fallback_rate,
+    cache_aware_returning_fallback_total,
+    cache_aware_returning_request_ratio,
+    cache_aware_returning_routed_total,
+    cache_aware_returning_stickiness_rate,
+    cache_aware_returning_sticky_total,
     cache_aware_stickiness_rate,
     cache_aware_sticky_total,
 )
@@ -141,6 +155,14 @@ class RoutingInterface(metaclass=SingletonABCMeta):
         finished. Overload-aware routers use this to keep their in-flight count
         accurate; the default is a no-op so the request path can call it on any
         router unconditionally.
+        """
+        return None
+
+    def close_returning_session_store(self) -> None:
+        """
+        Release any returning-session store backend (e.g. Redis connections).
+        Default is a no-op so app shutdown can call it on any router
+        unconditionally; only the cache-aware router owns such a store.
         """
         return None
 
@@ -245,10 +267,12 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     threshold (``tolerate_waiting_requests``). Latency percentile thresholds are
     added on top of the same ``_violated_reasons`` seam.
 
-    Concurrency: the mutable state (the window deque/counters and the in-flight
-    map) is only mutated from the asyncio event loop thread -- route_request and
-    release_inflight both run there -- so no lock is used. Do not call these from
-    a separate thread.
+    Concurrency: the mutable state (the window deque/counters, the in-flight
+    map, and the in-memory returning-session store) is only mutated from the
+    asyncio event loop thread -- route_request and release_inflight both run
+    there -- so no lock is used. Do not call these from a separate thread. The
+    Redis returning-session store is itself thread-safe (connection-pooled), but
+    is likewise only called from this path.
     """
 
     # All threshold names that can trigger a fallback (queue + latency).
@@ -265,6 +289,8 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         stats_window: float = 30.0,
         inflight_decay: float = 300.0,
         tie_tolerance: float = 0.0,
+        returning_session_ttl: float = 3600.0,
+        returning_session_store: Optional[ReturningSessionStore] = None,
     ):
         if hasattr(self, "_initialized"):
             return
@@ -291,10 +317,24 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         # rate metrics. Running counters are kept in sync with the deque so the
         # request path stays O(1) amortized.
         self.stats_window = stats_window
-        self._events: Deque[Tuple[float, bool, Tuple[str, ...]]] = deque()
+        # Each event also carries is_returning so the window can publish the
+        # first-visit / returning request funnel alongside the base rates.
+        self._events: Deque[Tuple[float, bool, Tuple[str, ...], bool]] = deque()
         self._win_total = 0
         self._win_fallback = 0
         self._win_reason: Counter = Counter()
+        # Returning subset of the window (2nd+ visit of a session id).
+        self._win_returning_total = 0
+        self._win_returning_fallback = 0
+
+        # Returning-session recognition (powers cache_aware_returning_* and
+        # cache_aware_first_visit_* metrics only; never affects routing).
+        self.returning_session_ttl = returning_session_ttl
+        self._returning_session_store: ReturningSessionStore = (
+            returning_session_store
+            if returning_session_store is not None
+            else create_returning_session_store("memory")
+        )
 
         # Per-engine in-flight accounting. The scraped engine queue is up to
         # --engine-stats-interval stale, so during a burst every fallback would
@@ -464,10 +504,16 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             self._record_dispatch(now, chosen)
             return chosen
 
+        # Record the visit before routing so a session's first request is a
+        # first visit and every later one (within the TTL) is "returning". This
+        # only feeds metrics; the routing decision below is unchanged.
+        is_returning = self._returning_session_store.visit(
+            session_id, now, self.returning_session_ttl
+        )
         initial_url = self.hash_ring.get_node(session_id)
         reasons = self._violated_reasons(initial_url, engine_stats, snapshot)
         if not reasons:
-            self._record(now, False, [])
+            self._record(now, False, [], is_returning)
             self._record_dispatch(now, initial_url)
             if logger.isEnabledFor(logging.DEBUG):
                 # Guard: _engine_load_str is evaluated eagerly as an argument, so
@@ -479,7 +525,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
                     self._engine_load_str(initial_url, engine_stats, snapshot, now),
                 )
             return initial_url
-        self._record(now, True, reasons)
+        self._record(now, True, reasons, is_returning)
         chosen = self._select_fallback(
             initial_url, endpoints, engine_stats, snapshot, now
         )
@@ -529,22 +575,40 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
     def _evict(self, now: float) -> None:
         cutoff = now - self.stats_window
         while self._events and self._events[0][0] < cutoff:
-            _, was_fallback, reasons = self._events.popleft()
+            _, was_fallback, reasons, was_returning = self._events.popleft()
             self._win_total -= 1
             if was_fallback:
                 self._win_fallback -= 1
             for reason in reasons:
                 self._win_reason[reason] -= 1
+            if was_returning:
+                self._win_returning_total -= 1
+                if was_fallback:
+                    self._win_returning_fallback -= 1
 
-    def _record(self, now: float, is_fallback: bool, reasons: List[str]) -> None:
-        """Record one session routing decision: update window gauges and counters."""
+    def _record(
+        self,
+        now: float,
+        is_fallback: bool,
+        reasons: List[str],
+        is_returning: bool = False,
+    ) -> None:
+        """Record one session routing decision: update window gauges and counters.
+
+        ``is_returning`` partitions the decision into the first-visit (N) or
+        returning (R) bucket of the request funnel.
+        """
         reasons = tuple(reasons)
-        self._events.append((now, is_fallback, reasons))
+        self._events.append((now, is_fallback, reasons, is_returning))
         self._win_total += 1
         if is_fallback:
             self._win_fallback += 1
         for reason in reasons:
             self._win_reason[reason] += 1
+        if is_returning:
+            self._win_returning_total += 1
+            if is_fallback:
+                self._win_returning_fallback += 1
         # Cumulative counters (monotonic; Prometheus computes rates over any window).
         if is_fallback:
             cache_aware_fallback_total.inc()
@@ -552,6 +616,19 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
                 cache_aware_fallback_reason_total.labels(reason=reason).inc()
         else:
             cache_aware_sticky_total.inc()
+        # Request funnel: each decision is exactly one of first-visit / returning.
+        if is_returning:
+            cache_aware_returning_routed_total.inc()
+            if is_fallback:
+                cache_aware_returning_fallback_total.inc()
+            else:
+                cache_aware_returning_sticky_total.inc()
+        else:
+            cache_aware_first_visit_routed_total.inc()
+            if is_fallback:
+                cache_aware_first_visit_fallback_total.inc()
+            else:
+                cache_aware_first_visit_sticky_total.inc()
         self._evict(now)
         self._publish_gauges()
 
@@ -575,6 +652,12 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
                 self._pending_load(url, now)
             )
 
+    def close_returning_session_store(self) -> None:
+        """Release the returning-session store backend (e.g. Redis connections)."""
+        store = getattr(self, "_returning_session_store", None)
+        if store is not None:
+            store.close()
+
     def _publish_gauges(self) -> None:
         total = self._win_total
         if total > 0:
@@ -585,11 +668,33 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
                 cache_aware_fallback_reason_rate.labels(reason=reason).set(
                     self._win_reason.get(reason, 0) / total
                 )
+            # Request funnel: split all session requests into first-visit (N)
+            # and returning (R), with |U| = |N| + |R|.
+            returning_total = self._win_returning_total
+            cache_aware_returning_request_ratio.set(returning_total / total)
+            cache_aware_first_visit_request_ratio.set((total - returning_total) / total)
         else:
             cache_aware_stickiness_rate.set(0)
             cache_aware_fallback_rate.set(0)
             for reason in self.REASONS:
                 cache_aware_fallback_reason_rate.labels(reason=reason).set(0)
+            cache_aware_returning_request_ratio.set(0)
+            cache_aware_first_visit_request_ratio.set(0)
+
+        # Stickiness / fallback rate computed ONLY over the returning subset R,
+        # so one-shot first visits do not dilute the returning-user view.
+        returning_total = self._win_returning_total
+        if returning_total > 0:
+            returning_sticky = returning_total - self._win_returning_fallback
+            cache_aware_returning_stickiness_rate.set(
+                returning_sticky / returning_total
+            )
+            cache_aware_returning_fallback_rate.set(
+                self._win_returning_fallback / returning_total
+            )
+        else:
+            cache_aware_returning_stickiness_rate.set(0)
+            cache_aware_returning_fallback_rate.set(0)
 
 
 class KvawareRouter(RoutingInterface):
@@ -859,8 +964,23 @@ def initialize_routing_logic(
             "stats_window",
             "inflight_decay",
             "tie_tolerance",
+            "returning_session_ttl",
         )
         router_kwargs = {k: kwargs[k] for k in optional if k in kwargs}
+        # Build the returning-session store from the *_store kwargs so the
+        # router itself stays agnostic of the backend choice.
+        if "returning_session_store" not in router_kwargs:
+            router_kwargs["returning_session_store"] = create_returning_session_store(
+                kwargs.get("returning_session_store_type", "memory"),
+                redis_url=kwargs.get("returning_session_redis_url"),
+                redis_key_prefix=kwargs.get(
+                    "returning_session_redis_key_prefix",
+                    "vllm:returning-session:",
+                ),
+                redis_timeout=kwargs.get("returning_session_redis_timeout", 0.05),
+                max_size=kwargs.get("returning_session_max_size", 0),
+                local_cache_size=kwargs.get("returning_session_local_cache_size", 0),
+            )
         return CacheAwareLoadBalancingRouter(
             session_key=kwargs.get("session_key"), **router_kwargs
         )

@@ -6,7 +6,17 @@ from vllm_router.services.metrics_service import (
     cache_aware_fallback_reason_rate,
     cache_aware_fallback_reason_total,
     cache_aware_fallback_total,
+    cache_aware_first_visit_fallback_total,
+    cache_aware_first_visit_request_ratio,
+    cache_aware_first_visit_routed_total,
+    cache_aware_first_visit_sticky_total,
     cache_aware_inflight_requests,
+    cache_aware_returning_fallback_rate,
+    cache_aware_returning_fallback_total,
+    cache_aware_returning_request_ratio,
+    cache_aware_returning_routed_total,
+    cache_aware_returning_stickiness_rate,
+    cache_aware_returning_sticky_total,
     cache_aware_stickiness_rate,
     cache_aware_sticky_total,
 )
@@ -483,3 +493,119 @@ def test_route_records_dispatch_for_chosen_engine():
     chosen = r._route_with_snapshot(eps, es, req, {}, now=now)
     assert r._pending_load(chosen, now) == 1
     assert chosen == initial  # under threshold -> sticky, still recorded
+
+
+# --- Returning-session request funnel: first visit vs returning ---
+
+
+def test_funnel_partitions_first_visit_and_returning():
+    # 3 distinct sessions, each visited twice within the TTL -> 3 first visits
+    # and 3 returning requests; window ratios are both 0.5.
+    r = _fresh_router(tolerate_waiting_requests=1000, stats_window=1000.0)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    es = _stats({u: 0 for u in ("http://e1", "http://e2", "http://e3")})
+    fv0 = cache_aware_first_visit_routed_total._value.get()
+    ret0 = cache_aware_returning_routed_total._value.get()
+    fvs0 = cache_aware_first_visit_sticky_total._value.get()
+    rets0 = cache_aware_returning_sticky_total._value.get()
+    now = 1000.0
+    for visit in range(2):
+        for s in ("a", "b", "c"):
+            r._route_with_snapshot(eps, es, FakeRequest({"session_id": s}), {}, now=now)
+
+    assert cache_aware_first_visit_routed_total._value.get() - fv0 == 3
+    assert cache_aware_returning_routed_total._value.get() - ret0 == 3
+    # all sticky (no overload)
+    assert cache_aware_first_visit_sticky_total._value.get() - fvs0 == 3
+    assert cache_aware_returning_sticky_total._value.get() - rets0 == 3
+    # window: 6 total, 3 returning
+    assert abs(cache_aware_returning_request_ratio._value.get() - 0.5) < 1e-9
+    assert abs(cache_aware_first_visit_request_ratio._value.get() - 0.5) < 1e-9
+
+
+def test_funnel_counters_partition_base_totals():
+    # The funnel buckets must exactly partition the base cache_aware_* totals:
+    #   first_visit_routed   + returning_routed   == sticky_total + fallback_total
+    #   first_visit_sticky   + returning_sticky   == sticky_total
+    #   first_visit_fallback + returning_fallback == fallback_total
+    r = _fresh_router(tolerate_waiting_requests=1000, stats_window=1000.0)
+
+    def snapshot():
+        return {
+            "fv_routed": cache_aware_first_visit_routed_total._value.get(),
+            "fv_sticky": cache_aware_first_visit_sticky_total._value.get(),
+            "fv_fallback": cache_aware_first_visit_fallback_total._value.get(),
+            "ret_routed": cache_aware_returning_routed_total._value.get(),
+            "ret_sticky": cache_aware_returning_sticky_total._value.get(),
+            "ret_fallback": cache_aware_returning_fallback_total._value.get(),
+            "sticky": cache_aware_sticky_total._value.get(),
+            "fallback": cache_aware_fallback_total._value.get(),
+        }
+
+    before = snapshot()
+    r._record(1000.0, False, [], is_returning=False)
+    r._record(1000.0, True, ["queue"], is_returning=False)
+    r._record(1000.0, False, [], is_returning=True)
+    r._record(1000.0, True, ["queue"], is_returning=True)
+    after = snapshot()
+    d = {k: after[k] - before[k] for k in before}
+
+    # Sanity on this batch: 4 decisions, 2 returning, 2 fallback.
+    assert d["fv_routed"] + d["ret_routed"] == 4
+    # Funnel partitions the base totals exactly.
+    assert d["fv_routed"] + d["ret_routed"] == d["sticky"] + d["fallback"]
+    assert d["fv_sticky"] + d["ret_sticky"] == d["sticky"]
+    assert d["fv_fallback"] + d["ret_fallback"] == d["fallback"]
+
+
+def test_returning_fallback_counted_in_returning_bucket():
+    r = _fresh_router(tolerate_waiting_requests=5, stats_window=1000.0)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    req = FakeRequest({"session_id": "abc"})
+    r._update_hash_ring(eps)
+    initial = r.hash_ring.get_node("abc")
+    urls = ("http://e1", "http://e2", "http://e3")
+
+    fvs0 = cache_aware_first_visit_sticky_total._value.get()
+    rfb0 = cache_aware_returning_fallback_total._value.get()
+
+    # First visit, sticky engine healthy -> first-visit sticky.
+    r._route_with_snapshot(eps, _stats({u: 0 for u in urls}), req, {}, now=1000.0)
+    # Second visit, sticky engine overloaded -> returning fallback.
+    es_bad = _stats({u: (99 if u == initial else 0) for u in urls})
+    r._route_with_snapshot(eps, es_bad, req, {}, now=1000.0)
+
+    assert cache_aware_first_visit_sticky_total._value.get() - fvs0 == 1
+    assert cache_aware_returning_fallback_total._value.get() - rfb0 == 1
+    # Returning subset R has 1 request, a fallback.
+    assert cache_aware_returning_fallback_rate._value.get() == 1.0
+    assert cache_aware_returning_stickiness_rate._value.get() == 0.0
+
+
+def test_returning_ttl_expiry_resets_to_first_visit():
+    r = _fresh_router(
+        tolerate_waiting_requests=1000, stats_window=1000.0, returning_session_ttl=10.0
+    )
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2", "http://e3")]
+    es = _stats({u: 0 for u in ("http://e1", "http://e2", "http://e3")})
+    req = FakeRequest({"session_id": "abc"})
+    fv0 = cache_aware_first_visit_routed_total._value.get()
+    ret0 = cache_aware_returning_routed_total._value.get()
+
+    r._route_with_snapshot(eps, es, req, {}, now=1000.0)  # first visit
+    r._route_with_snapshot(eps, es, req, {}, now=1005.0)  # within TTL -> returning
+    r._route_with_snapshot(eps, es, req, {}, now=1100.0)  # past TTL -> first visit
+
+    assert cache_aware_first_visit_routed_total._value.get() - fv0 == 2
+    assert cache_aware_returning_routed_total._value.get() - ret0 == 1
+
+
+def test_no_session_request_not_counted_in_funnel():
+    r = _fresh_router(tolerate_waiting_requests=5, stats_window=1000.0)
+    eps = [FakeEndpoint(u) for u in ("http://e1", "http://e2")]
+    es = _stats({"http://e1": 0, "http://e2": 0})
+    fv0 = cache_aware_first_visit_routed_total._value.get()
+    ret0 = cache_aware_returning_routed_total._value.get()
+    r._route_with_snapshot(eps, es, FakeRequest({}), {}, now=1000.0)  # no session id
+    assert cache_aware_first_visit_routed_total._value.get() - fv0 == 0
+    assert cache_aware_returning_routed_total._value.get() - ret0 == 0

@@ -84,3 +84,75 @@ cache_aware_fallback_reason_total = Counter(
     "Total session requests for which each threshold triggered fallback",
     ["reason"],
 )
+
+# --- Returning-session request funnel ---------------------------------------
+# Every session request this router routes is partitioned, within the returning
+# TTL, into exactly one of:
+#   * first visit  -- first time this session id is seen (one-shot or the first
+#                     of several visits). These should be excluded when judging
+#                     how sticky *returning* users are.
+#   * returning    -- the session was seen before (2nd+ visit). This is the
+#                     subset that reflects whether the upstream multi-provider
+#                     layer actually sent the same session back to this provider
+#                     AND whether this router then kept it on its sticky engine.
+# Each of the two is further split into sticky / fallback, mirroring the base
+# cache_aware_* metrics. Invariants (cumulative counters):
+#   first_visit_routed + returning_routed == sticky_total + fallback_total
+#   first_visit_sticky + returning_sticky == sticky_total
+#   first_visit_fallback + returning_fallback == fallback_total
+cache_aware_first_visit_routed_total = Counter(
+    "vllm:cache_aware_first_visit_routed_total",
+    "Total session requests routed on the first visit of a session id (within "
+    "the returning TTL)",
+)
+cache_aware_first_visit_sticky_total = Counter(
+    "vllm:cache_aware_first_visit_sticky_total",
+    "First-visit session requests whose sticky engine was not overloaded",
+)
+cache_aware_first_visit_fallback_total = Counter(
+    "vllm:cache_aware_first_visit_fallback_total",
+    "First-visit session requests whose sticky engine was overloaded (fallback)",
+)
+cache_aware_returning_routed_total = Counter(
+    "vllm:cache_aware_returning_routed_total",
+    "Total session requests routed for a returning session (2nd+ visit within "
+    "the returning TTL)",
+)
+cache_aware_returning_sticky_total = Counter(
+    "vllm:cache_aware_returning_sticky_total",
+    "Returning session requests whose sticky engine was not overloaded",
+)
+cache_aware_returning_fallback_total = Counter(
+    "vllm:cache_aware_returning_fallback_total",
+    "Returning session requests whose sticky engine was overloaded (fallback)",
+)
+
+# Sliding-window probabilities for the funnel (decay to 0 when traffic stops).
+cache_aware_first_visit_request_ratio = Gauge(
+    "vllm:cache_aware_first_visit_request_ratio",
+    "Fraction of session requests in the window that were a session's first "
+    "visit (|N| / |U|)",
+)
+cache_aware_returning_request_ratio = Gauge(
+    "vllm:cache_aware_returning_request_ratio",
+    "Fraction of session requests in the window that were returning visits "
+    "(|R| / |U|)",
+)
+cache_aware_returning_stickiness_rate = Gauge(
+    "vllm:cache_aware_returning_stickiness_rate",
+    "Among returning session requests in the window, fraction whose sticky "
+    "engine was not overloaded (R_sticky / |R|)",
+)
+cache_aware_returning_fallback_rate = Gauge(
+    "vllm:cache_aware_returning_fallback_rate",
+    "Among returning session requests in the window, fraction whose sticky "
+    "engine was overloaded (R_fallback / |R|)",
+)
+
+# Returning-session store backend health (Redis). Incremented on any fail-open
+# event; routing is unaffected but returning metrics degrade while this rises.
+cache_aware_returning_session_store_errors_total = Counter(
+    "vllm:cache_aware_returning_session_store_errors_total",
+    "Returning-session store backend errors (fail-open; routing unaffected)",
+    ["operation"],
+)
