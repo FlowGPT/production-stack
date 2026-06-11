@@ -1,7 +1,7 @@
 # v1.1 更新日志 — 回访会话指标 + Redis 多副本
 
 > 镜像：`ssadds/production-stack-router:v1.1`
-> digest：`sha256:64830686e27307417e4acc915b526b21c5a71f24f8fb4294b60a9e5edf1a67e9`
+> digest：`sha256:e713ffe1df19efadf4ee3626479fe2b0c20fd0fd358a7c70b9e7257fafbb137e`
 > 在 v1.0（cache-aware 路由）基础上的一次**纯观测性**更新：新增回访会话指标，路由行为不变。
 > 详细设计见 [cache-aware-returning-session.md](cache-aware-returning-session.md)。
 
@@ -69,6 +69,7 @@ Gauge：`cache_aware_first_visit_request_ratio`、`cache_aware_returning_request
 
 ## 兼容性与开销
 
+- **日志默认 INFO（性能/成本改进）**：`init_logger` 默认级别从 DEBUG 改为 INFO，可由环境变量 `VLLM_ROUTER_LOG_LEVEL` 或 `--log-level` 调整。此前默认 DEBUG 会对每个请求打印整串 header 等，在生产 QPS 下占用事件循环 CPU 与 stdout I/O；改为 INFO 后这些 per-request DEBUG 不再输出。排障时设 `--log-level debug` 即可恢复。
 - **路由行为不变**：选引擎/过载/fallback/hash ring 一律未改，新代码只多记一个指标标签。
 - 默认 `store=memory`，行为与 v1.0 一致；每请求多一次 `visit()`：memory ~0.9µs（与基数无关），redis 同节点 ~0.18ms（端到端影响 < 3%）。
 - 原有 `cache_aware_*` 指标不变。

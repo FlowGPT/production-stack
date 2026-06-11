@@ -43,17 +43,17 @@ affinity), while redis stays authoritative for cross-replica first contact.
 
 from __future__ import annotations
 
-import logging
 from collections import OrderedDict
 from typing import Optional, Protocol
 
 import xxhash
 
+from vllm_router.log import init_logger
 from vllm_router.services.metrics_service import (
     cache_aware_returning_session_store_errors_total,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # One round-trip: report whether the key already existed, then (re)set it with a
 # fresh TTL. Returning recognition + mark-seen in a single atomic call.

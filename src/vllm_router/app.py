@@ -26,6 +26,7 @@ from vllm_router.dynamic_config import (
 )
 from vllm_router.experimental import get_feature_gates, initialize_feature_gates
 from vllm_router.httpx_client import HTTPXClientWrapper
+from vllm_router.log import set_log_level
 from vllm_router.parsers.parser import parse_args
 from vllm_router.routers.batches_router import batches_router
 from vllm_router.routers.files_router import files_router
@@ -294,6 +295,9 @@ app.state.semantic_cache_available = semantic_cache_available
 
 def main():
     args = parse_args()
+    # Apply --log-level to the vllm_router loggers (created at import time).
+    # Default is INFO; pass --log-level debug only for troubleshooting.
+    set_log_level(args.log_level)
     initialize_all(app, args)
     if args.log_stats:
         threading.Thread(

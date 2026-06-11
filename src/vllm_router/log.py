@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from logging import Logger
 
@@ -41,12 +42,29 @@ class MaxLevelFilter(logging.Filter):
         return record.levelno <= self.max_level
 
 
-def init_logger(name: str, log_level=logging.DEBUG) -> Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(log_level)
+def _resolve_level(log_level) -> int:
+    """Resolve a level from an explicit value, the VLLM_ROUTER_LOG_LEVEL env var,
+    or the default (INFO). DEBUG is opt-in: at production QPS the per-request
+    DEBUG logging (full header dumps etc.) adds event-loop CPU and stdout I/O."""
+    if log_level is None:
+        log_level = os.environ.get("VLLM_ROUTER_LOG_LEVEL", "INFO")
+    if isinstance(log_level, str):
+        # uvicorn's "trace" maps to the most verbose logging level.
+        if log_level.lower() == "trace":
+            return logging.DEBUG
+        return getattr(logging, log_level.upper(), logging.INFO)
+    return log_level
 
+
+def init_logger(name: str, log_level=None) -> Logger:
+    level = _resolve_level(log_level)
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    # The logger level is the single control point: stdout handler passes
+    # everything (capped at INFO by the filter), stderr handler takes WARNING+.
     stdout_stream = logging.StreamHandler(sys.stdout)
-    stdout_stream.setLevel(log_level)
+    stdout_stream.setLevel(logging.NOTSET)
     stdout_stream.setFormatter(CustomFormatter())
     stdout_stream.addFilter(MaxLevelFilter(logging.INFO))
     logger.addHandler(stdout_stream)
@@ -58,3 +76,16 @@ def init_logger(name: str, log_level=logging.DEBUG) -> Logger:
     logger.propagate = False
 
     return logger
+
+
+def set_log_level(log_level) -> None:
+    """Apply a log level to every vllm_router logger at runtime.
+
+    Module loggers are created at import time (before args are parsed), so this
+    lets --log-level take effect after the fact. The logger level is the single
+    control point (handlers are level-agnostic), so setting it here is enough.
+    """
+    level = _resolve_level(log_level)
+    for name, candidate in list(logging.root.manager.loggerDict.items()):
+        if name.startswith("vllm_router") and isinstance(candidate, logging.Logger):
+            candidate.setLevel(level)
