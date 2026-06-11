@@ -1,9 +1,11 @@
 # v1.1 更新日志 — 回访会话指标 + Redis 多副本
 
 > 镜像：`ssadds/production-stack-router:v1.1`
-> digest：`sha256:c5382c32452a2db402bc2c32a59368bb8c90f58c054451b479c0adb736155c3b`
+> digest：`sha256:64830686e27307417e4acc915b526b21c5a71f24f8fb4294b60a9e5edf1a67e9`
 > 在 v1.0（cache-aware 路由）基础上的一次**纯观测性**更新：新增回访会话指标，路由行为不变。
 > 详细设计见 [cache-aware-returning-session.md](cache-aware-returning-session.md)。
+
+> **基线说明**：v1.1 是 v1.0 的**超集**——保留 v1.0 的全部能力，包括容量瞬时队列触发参数 `--cache-aware-engine-max-concurrency`（突发时用 in-flight 估算队列、抢在 scrape 之前触发 fallback），原有 `--cache-aware-*` 参数均不变。本次只在其上**新增**回访会话观测。
 
 ## 新增能力
 

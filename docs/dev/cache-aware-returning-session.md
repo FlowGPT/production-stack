@@ -158,17 +158,16 @@ Redis 仅共享「这个 session 见过没」，**不参与选引擎**。以下�
 `store=redis` 需要 `redis` 依赖。默认 Dockerfile 已包含：
 
 ```dockerfile
-ARG INSTALL_OPTIONAL_DEP=semantic_cache,lmcache,redis
+ARG INSTALL_OPTIONAL_DEP=semantic_cache,redis
 ```
 
-如自定义构建，确保带上 `redis`：
+直接构建即可（与 v1.0 一致的 `semantic_cache` + 新增 `redis`，不含 lmcache）：
 
 ```bash
-docker build --build-arg INSTALL_OPTIONAL_DEP=semantic_cache,lmcache,redis \
-  -t <your-repo>/production-stack-router:<tag> -f docker/Dockerfile .
+docker build -t <your-repo>/production-stack-router:v1.1 -f docker/Dockerfile .
 ```
 
-## 9. K8s 多副本部署
+## 9. K8s 多副本部署（完整示例）
 
 **所有 Router 副本共用 1 个 Redis Service**（不是每副本一个；生产建议这 1 个 Redis 做 HA）。
 
@@ -179,14 +178,24 @@ Client → Service → Router Pod 1 ─┐
                  → vLLM Engine Pods（路由照旧，与 Redis 无关）
 ```
 
-### 9.1 部署 Redis（与 Router 同 namespace）
+下面给两条完整路径：**9.1 Redis 是公共前置**，然后二选一——**9.2 Helm**（production-stack 标准部署方式，推荐）或 **9.3 裸 manifest**（不用 Helm 时）。示例 namespace 用 `inference`，按需替换。
+
+### 9.1 部署 Redis（公共，两种方式都需要）
+
+`redis.yaml`：
 
 ```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vllm-router-redis
-  namespace: <ns>
+  namespace: inference
+  labels: {app: vllm-router-redis}
 spec:
   replicas: 1
   selector:
@@ -198,59 +207,227 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
-          ports: [{containerPort: 6379}]
+          # maxmemory 设到 limit 的 ~75%，到顶时优先淘汰最接近过期的 key
+          # （所有 key 都带 TTL）；router 是 fail-open，淘汰也不影响推理。
+          args: ["redis-server", "--maxmemory", "400mb", "--maxmemory-policy", "volatile-ttl"]
+          ports: [{containerPort: 6379, name: redis}]
           resources:
             requests: {cpu: "100m", memory: "256Mi"}
             limits: {memory: "512Mi"}
+          readinessProbe:
+            tcpSocket: {port: 6379}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: 6379}
+            initialDelaySeconds: 10
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: vllm-router-redis
-  namespace: <ns>
+  namespace: inference
 spec:
   selector: {app: vllm-router-redis}
   ports: [{port: 6379, targetPort: 6379}]
 ```
 
-集群内地址：`redis://vllm-router-redis.<ns>.svc.cluster.local:6379/0`（同 namespace 可简写 `redis://vllm-router-redis:6379/0`）。
+```bash
+kubectl apply -f redis.yaml
+kubectl get pods -n inference -l app=vllm-router-redis
+```
 
-> 已有 Redis Service（如 `kaon-router-gemma4-31b-redis`）直接用其 DNS 名即可：
-> `redis://kaon-router-gemma4-31b-redis.<ns>.svc.cluster.local:6379/0`。
+集群内地址：`redis://vllm-router-redis.inference.svc.cluster.local:6379/0`（同 namespace 可简写 `redis://vllm-router-redis:6379/0`）。
 
-### 9.2 Helm `routerSpec`（多副本指向同一 Redis）
+> 已有 Redis Service（如 `kaon-router-gemma4-31b-redis`）直接用其 DNS 名，跳过本步。
+
+### 9.2 方式一：Helm（推荐）
+
+完整 `values.yaml` 片段（其余按你现有部署保留；关键是 `routerSpec`）：
 
 ```yaml
+servingEngineSpec:
+  runtimeClassName: ""
+  modelSpec:
+    - name: "gemma"
+      repository: "vllm/vllm-openai"
+      tag: "latest"
+      modelURL: "RedHatAI/gemma-4-31B-it-NVFP4"
+      replicaCount: 2
+      requestCPU: 8
+      requestMemory: "32Gi"
+      requestGPU: 1
+
 routerSpec:
-  replicaCount: 2                 # 多副本才需要 redis
-  tag: <带 redis 依赖的镜像 tag>
-  routingLogic: cache_aware_load_balancing
-  sessionKey: x-session-id        # 与客户端 header 一致
+  enableRouter: true
+  replicaCount: 2                                   # 多副本才需要 redis
+  repository: "ssadds/production-stack-router"
+  tag: "v1.1"                                        # 含 redis 依赖的镜像
+  routingLogic: "cache_aware_load_balancing"
+  sessionKey: "x-session-id"                         # 与客户端 header 一致
+  engineScrapeInterval: 3
+  resources:
+    requests: {cpu: "2", memory: "4Gi"}
+    limits: {cpu: "4", memory: "8Gi"}
   extraArgs:
+    # —— 原有 cache-aware 调优参数（按需）——
+    - "--cache-aware-tolerate-waiting-requests"
+    - "20"
+    # —— 回访会话 + Redis（核心 4 项）——
     - "--cache-aware-returning-session-store"
     - "redis"
     - "--cache-aware-returning-session-redis-url"
-    - "redis://vllm-router-redis.<ns>.svc.cluster.local:6379/0"
+    - "redis://vllm-router-redis.inference.svc.cluster.local:6379/0"
     - "--cache-aware-returning-session-ttl"
     - "1800"
+    # —— 可选：本副本前置缓存，省 Redis 往返（LB 亲和时）——
+    - "--cache-aware-returning-session-local-cache-size"
+    - "100000"
 ```
 
-有密码：用 Secret 注入，URL 写 `redis://:PASSWORD@host:6379/0`，不要明文入库。
+```bash
+helm upgrade --install <release> ./helm -n inference -f values.yaml
+```
+
+### 9.3 方式二：裸 manifest（不用 Helm）
+
+Router 用 K8s 服务发现自动找引擎 Pod（按 label 选择）。`router.yaml`：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router
+  namespace: inference
+  labels: {app: vllm-router}
+spec:
+  replicas: 2                                        # 多副本
+  selector:
+    matchLabels: {app: vllm-router}
+  template:
+    metadata:
+      labels: {app: vllm-router}
+    spec:
+      serviceAccountName: vllm-router-sa             # 需有 list/watch pods 权限
+      containers:
+        - name: router
+          image: ssadds/production-stack-router:v1.1
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--service-discovery"
+            - "k8s"
+            - "--k8s-namespace"
+            - "inference"
+            - "--k8s-label-selector"
+            - "model=gemma"                          # 选中你的引擎 Pod
+            - "--k8s-port"
+            - "8000"
+            - "--routing-logic"
+            - "cache_aware_load_balancing"
+            - "--session-key"
+            - "x-session-id"
+            - "--engine-stats-interval"
+            - "3"
+            - "--cache-aware-tolerate-waiting-requests"
+            - "20"
+            - "--cache-aware-returning-session-store"
+            - "redis"
+            - "--cache-aware-returning-session-redis-url"
+            - "redis://vllm-router-redis.inference.svc.cluster.local:6379/0"
+            - "--cache-aware-returning-session-ttl"
+            - "1800"
+            - "--cache-aware-returning-session-local-cache-size"
+            - "100000"
+          ports: [{containerPort: 8000, name: http}]
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits: {cpu: "4", memory: "8Gi"}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router-service
+  namespace: inference
+spec:
+  selector: {app: vllm-router}
+  ports: [{port: 80, targetPort: 8000}]
+---
+# K8s 服务发现需要列出/监听 Pod 的权限
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: vllm-router-sa, namespace: inference}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: vllm-router-role, namespace: inference}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: vllm-router-rb, namespace: inference}
+subjects:
+  - {kind: ServiceAccount, name: vllm-router-sa, namespace: inference}
+roleRef: {kind: Role, name: vllm-router-role, apiGroup: rbac.authorization.k8s.io}
+```
+
+```bash
+kubectl apply -f router.yaml
+```
+
+### 9.4 带密码的 Redis（生产建议）
+
+```bash
+kubectl create secret generic vllm-router-redis-auth -n inference \
+  --from-literal=password='YOUR_PASSWORD'
+```
+
+Redis Deployment 容器改为：
+
+```yaml
+          args: ["redis-server", "--requirepass", "$(REDIS_PASSWORD)",
+                 "--maxmemory", "400mb", "--maxmemory-policy", "volatile-ttl"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: vllm-router-redis-auth, key: password}
+```
+
+Router 的 redis-url 写成（密码用 Secret 注入到环境变量再拼，避免明文入库）：
+`redis://:YOUR_PASSWORD@vllm-router-redis.inference.svc.cluster.local:6379/0`
 
 ## 10. 验证
 
 ```bash
-# Redis 通不通
-kubectl run -it --rm redis-test -n <ns> --image=redis:7-alpine -- \
-  redis-cli -h vllm-router-redis ping
+# 1) Redis 通不通
+kubectl run -it --rm redis-test -n inference --image=redis:7-alpine -- \
+  redis-cli -h vllm-router-redis ping            # 期望 PONG
 
-# Router 指标
-kubectl port-forward -n <ns> svc/<router-service> 8000:80
+# 2) Service 后面有 Pod（Endpoints 非空）
+kubectl get endpoints -n inference vllm-router-redis
+
+# 3) Router 指标（端口名按你的 Service 调整）
+kubectl port-forward -n inference svc/vllm-router-service 8000:80
 curl -s localhost:8000/metrics | grep -E 'cache_aware_(first_visit|returning)'
 curl -s localhost:8000/metrics | grep returning_session_store_errors   # 应为 0 / 无增量
+
+# 4) Redis 里的回访 key 数（≈ TTL 内活跃 unique session 数）
+kubectl run -it --rm redis-cli -n inference --image=redis:7-alpine -- \
+  redis-cli -h vllm-router-redis dbsize
 ```
 
 > Router 镜像**不含** `redis-cli` 二进制；查 Redis 用单独的 `redis:7-alpine` 容器或 `kubectl exec` 进 Redis Pod。
+> 多副本务必让所有 Router 填**同一个** redis-url；只有 `replicaCount: 1` 时才可省去 Redis 用默认 `memory`。
 
 ## 11. 选型
 
