@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
+import json
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 
@@ -83,6 +86,26 @@ logger = logging.getLogger("uvicorn")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Multi-worker mode: uvicorn spawns worker processes that import this module
+    # fresh and never run main(), so each worker initializes itself here from the
+    # args main() serialized into the environment. The single-worker path already
+    # initialized in main() (router singleton set), so this is skipped there.
+    already_initialized = True
+    try:
+        get_routing_logic()
+    except ValueError:
+        already_initialized = False
+    if not already_initialized:
+        serialized = os.environ.get("VLLM_ROUTER_INIT_ARGS")
+        if not serialized:
+            # Fail loudly instead of silently serving an uninitialized worker
+            # (which would only surface as request-time errors).
+            raise RuntimeError(
+                "Router worker started uninitialized but VLLM_ROUTER_INIT_ARGS "
+                "is not set; cannot configure routing."
+            )
+        _initialize_from_args(argparse.Namespace(**json.loads(serialized)))
+
     app.state.httpx_client_wrapper.start()
     if hasattr(app.state, "batch_processor"):
         await app.state.batch_processor.initialize()
@@ -293,8 +316,9 @@ app.state.httpx_client_wrapper = HTTPXClientWrapper()
 app.state.semantic_cache_available = semantic_cache_available
 
 
-def main():
-    args = parse_args()
+def _initialize_from_args(args):
+    """Per-process initialization (runs once in single-worker main(), or once in
+    each worker's lifespan when --router-workers > 1)."""
     # Apply --log-level to the vllm_router loggers (created at import time).
     # Default is INFO; pass --log-level debug only for troubleshooting.
     set_log_level(args.log_level)
@@ -308,11 +332,47 @@ def main():
             ),
             daemon=True,
         ).start()
-
     # Workaround to avoid footguns where uvicorn drops requests with too
     # many concurrent requests active.
     set_ulimit()
-    uvicorn.run(app, host=args.host, port=args.port)
+
+
+def main():
+    args = parse_args()
+    workers = args.router_workers
+    if workers > 1:
+        # Run N uvicorn workers (N event loops -> N cores), the throughput fix
+        # for the single-event-loop bottleneck. Workers import the app fresh and
+        # initialize themselves from these args via the lifespan; per-worker
+        # state (in-flight / window counters) is independent, like extra
+        # replicas -- share returning-session state via the redis store.
+        set_log_level(args.log_level)
+        # Prometheus multiprocess: each worker writes metrics to this dir and
+        # /metrics aggregates across them (counters sum). Must be set, and the
+        # dir emptied, before workers import the metrics module. Single-worker
+        # mode never sets it, so its metrics behavior is unchanged.
+        mp_dir = (
+            os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+            or "/tmp/vllm_router_prometheus_multiproc"
+        )
+        os.makedirs(mp_dir, exist_ok=True)
+        for fn in os.listdir(mp_dir):
+            try:
+                os.remove(os.path.join(mp_dir, fn))
+            except OSError:
+                pass
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = mp_dir
+        os.environ["VLLM_ROUTER_INIT_ARGS"] = json.dumps(vars(args), default=str)
+        set_ulimit()
+        uvicorn.run(
+            "vllm_router.app:app",
+            host=args.host,
+            port=args.port,
+            workers=workers,
+        )
+    else:
+        _initialize_from_args(args)
+        uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

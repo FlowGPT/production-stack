@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 
 import psutil
 from fastapi import APIRouter, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    generate_latest,
+    multiprocess,
+)
 
 from vllm_router.service_discovery import get_service_discovery
+from vllm_router.services.metrics_service import Gauge  # multiprocess-aware wrapper
 from vllm_router.services.metrics_service import (
     avg_decoding_length,
     avg_itl,
@@ -141,5 +148,11 @@ async def metrics():
             1 if getattr(ep, "healthy", True) else 0
         )
 
-    # Return all metrics in Prometheus format
+    # Return all metrics in Prometheus format. Under multi-worker (multiprocess)
+    # mode, aggregate every worker's metrics via the multiprocess collector so
+    # counters sum across workers instead of returning just this worker's slice.
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

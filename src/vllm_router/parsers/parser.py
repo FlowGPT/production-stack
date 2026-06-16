@@ -105,6 +105,8 @@ def validate_args(args):
         raise ValueError("Engine stats interval must be greater than 0.")
     if args.request_stats_window <= 0:
         raise ValueError("Request stats window must be greater than 0.")
+    if args.router_workers < 1:
+        raise ValueError("--router-workers must be >= 1.")
 
 
 def parse_args():
@@ -114,6 +116,18 @@ def parse_args():
     )
     parser.add_argument(
         "--port", type=int, default=8001, help="The port to run the server on."
+    )
+    parser.add_argument(
+        "--router-workers",
+        type=int,
+        default=1,
+        help="Number of uvicorn worker processes (event loops) for the router. "
+        "The router proxies every request and streams every response token "
+        "through a single asyncio event loop, so one worker is bottlenecked at "
+        "~1 CPU core. Set >1 to run multiple loops in one pod (near-linear "
+        "throughput gain). Each worker keeps independent in-flight/window state "
+        "(like extra replicas); share returning-session state via the redis "
+        "store. Default 1.",
     )
     parser.add_argument(
         "--service-discovery",

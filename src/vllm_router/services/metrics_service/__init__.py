@@ -1,4 +1,18 @@
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter
+from prometheus_client import Gauge as _Gauge
+
+
+def Gauge(*args, **kwargs):
+    """Gauge that, in multiprocess (multi-worker) mode, defaults to the
+    "mostrecent" aggregation so each metric stays a single coherent series (the
+    most recently written value across workers) instead of exploding into a
+    per-pid series. Counters already sum across workers automatically; for
+    cluster-accurate rates use the ``*_total`` counters with rate() rather than
+    these window gauges. The kwarg is ignored when not in multiprocess mode
+    (single worker), so single-worker behavior is unchanged."""
+    kwargs.setdefault("multiprocess_mode", "mostrecent")
+    return _Gauge(*args, **kwargs)
+
 
 # --- Prometheus Gauges ---
 # Existing metrics
