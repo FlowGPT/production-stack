@@ -226,6 +226,7 @@ def initialize_all(app: FastAPI, args):
         inflight_decay=args.cache_aware_inflight_decay,
         tie_tolerance=args.cache_aware_tie_tolerance,
         engine_max_concurrency=args.cache_aware_engine_max_concurrency,
+        hash_vnodes=args.cache_aware_hash_vnodes,
         returning_session_ttl=args.cache_aware_returning_session_ttl,
         returning_session_store_type=args.cache_aware_returning_session_store,
         returning_session_redis_url=args.cache_aware_returning_session_redis_url,

@@ -198,6 +198,31 @@ def test_churn_removed_engine_never_selected():
         assert url in ("http://e1", "http://e2")
 
 
+def test_hash_vnodes_default_and_tighter_distribution():
+    # The vnodes knob smooths the session-key distribution across engines.
+    # Default must be 1000 (the value app.py/parser advertise), and a larger
+    # ring must produce a tighter max/min spread than the old 160 default.
+    from collections import Counter
+
+    r = _fresh_router()
+    assert r.hash_vnodes == 1000
+
+    def spread(vnodes):
+        rr = _fresh_router(hash_vnodes=vnodes)
+        urls = [f"http://e{i}" for i in range(40)]
+        rr._update_hash_ring([FakeEndpoint(u) for u in urls])
+        counts = Counter(rr.hash_ring.get_node(f"sess-{k}") for k in range(40000))
+        vals = sorted(counts.values())
+        return vals[-1] / vals[0]
+
+    coarse = spread(160)
+    fine = spread(1000)
+    # More vnodes => strictly smoother. Use a margin so the assertion is not
+    # flaky on the deterministic key set above.
+    assert fine < coarse
+    assert fine < 1.25
+
+
 def _snap(p50_ttft=-1, p99_ttft=-1, p50_e2e=-1, p99_e2e=-1):
     return {
         "p50_ttft": p50_ttft,

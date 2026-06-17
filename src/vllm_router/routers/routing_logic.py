@@ -293,6 +293,7 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
         inflight_decay: float = 300.0,
         tie_tolerance: float = 0.0,
         engine_max_concurrency: int = 0,
+        hash_vnodes: int = 1000,
         returning_session_ttl: float = 3600.0,
         returning_session_store: Optional[ReturningSessionStore] = None,
     ):
@@ -321,7 +322,15 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             "p50_e2e": p50_e2e_threshold,
             "p99_e2e": p99_e2e_threshold,
         }
-        self.hash_ring = HashRing()
+        # Virtual nodes per physical engine on the consistent-hash ring. More
+        # vnodes => smoother session-key distribution => tighter per-engine QPS
+        # spread. Across 40 engines the default 160 leaves max/min ~1.4; 1000
+        # brings it to ~1.1-1.2 (closer to 1.1 the more distinct active sessions
+        # there are). Affinity is unchanged: a session still maps
+        # deterministically to one engine. Ring is only rebuilt on topology
+        # change, so the larger ring has negligible steady-state cost.
+        self.hash_vnodes = hash_vnodes
+        self.hash_ring = HashRing(vnodes=hash_vnodes)
 
         # Sliding-window tally of routing decisions for stickiness / fallback
         # rate metrics. Running counters are kept in sync with the deque so the
@@ -984,6 +993,7 @@ def initialize_routing_logic(
             "inflight_decay",
             "tie_tolerance",
             "engine_max_concurrency",
+            "hash_vnodes",
             "returning_session_ttl",
         )
         router_kwargs = {k: kwargs[k] for k in optional if k in kwargs}

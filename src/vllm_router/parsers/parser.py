@@ -277,6 +277,17 @@ def parse_args():
         "(randomise only exact ties).",
     )
     parser.add_argument(
+        "--cache-aware-hash-vnodes",
+        type=int,
+        default=1000,
+        help="cache_aware_load_balancing: virtual nodes per engine on the "
+        "consistent-hash ring. Higher => smoother session-key distribution => "
+        "tighter per-engine QPS spread (across 40 engines, 160 leaves max/min "
+        "~1.4; 1000 brings it to ~1.1-1.2, closer to 1.1 the more distinct "
+        "active sessions there are). Does not change cache affinity. "
+        "Default 1000.",
+    )
+    parser.add_argument(
         "--cache-aware-returning-session-ttl",
         type=float,
         default=3600.0,
