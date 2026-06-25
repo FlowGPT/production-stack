@@ -1,0 +1,10 @@
+# Patch the reconcile/stale-engine fix onto the released v1.2 router image.
+# Only the three changed files are overlaid onto the installed package; nothing
+# else in v1.2 is altered. Build context = repo root.
+FROM ssadds/production-stack-router:v1.2
+
+ARG PKG=/usr/local/lib/python3.12/site-packages/vllm_router
+
+COPY src/vllm_router/service_discovery.py ${PKG}/service_discovery.py
+COPY src/vllm_router/parsers/parser.py ${PKG}/parsers/parser.py
+COPY src/vllm_router/app.py ${PKG}/app.py
