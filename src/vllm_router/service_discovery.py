@@ -332,6 +332,7 @@ class K8sServiceDiscovery(ServiceDiscovery):
         label_selector=None,
         prefill_model_labels: List[str] | None = None,
         decode_model_labels: List[str] | None = None,
+        reconcile_interval: float = 30.0,
     ):
         """
         Initialize the Kubernetes service discovery module. This module
@@ -345,6 +346,8 @@ class K8sServiceDiscovery(ServiceDiscovery):
             namespace: the namespace of the engine pods
             port: the port of the engines
             label_selector: the label selector of the engines
+            reconcile_interval: seconds between stale-engine prunes (see
+                ``_reconcile_once``). <= 0 disables it.
         """
         self.app = app
         self.namespace = namespace
@@ -352,6 +355,7 @@ class K8sServiceDiscovery(ServiceDiscovery):
         self.available_engines: Dict[str, EndpointInfo] = {}
         self.available_engines_lock = threading.Lock()
         self.label_selector = label_selector
+        self.reconcile_interval = reconcile_interval
 
         # Init kubernetes watcher
         try:
@@ -366,6 +370,16 @@ class K8sServiceDiscovery(ServiceDiscovery):
         self.running = True
         self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
         self.watcher_thread.start()
+        # Authoritative prune of ghost engines the watch can leak; see
+        # _reconcile_once. Set on close() to wake the loop immediately.
+        self._stop_event = threading.Event()
+        if reconcile_interval and reconcile_interval > 0:
+            self.reconcile_thread = threading.Thread(
+                target=self._reconcile_loop, daemon=True
+            )
+            self.reconcile_thread.start()
+        else:
+            self.reconcile_thread = None
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
 
@@ -665,6 +679,68 @@ class K8sServiceDiscovery(ServiceDiscovery):
                 self._delete_engine(engine_name)
                 return
 
+    def _reconcile_loop(self) -> None:
+        """Run ``_reconcile_once`` every ``reconcile_interval`` seconds until
+        ``_stop_event`` is set (``wait`` returns True only when stopped)."""
+        while not self._stop_event.wait(self.reconcile_interval):
+            try:
+                self._reconcile_once()
+            except Exception as e:
+                logger.error(f"Service discovery reconcile error: {e}")
+
+    def _reconcile_once(self) -> None:
+        """
+        Authoritative full-state prune of stale engines.
+
+        The watch can leave a removed pod in ``available_engines`` forever: a
+        dying node emits no clean DELETED event, and a watch reconnect resumes
+        without replaying missed deletes -- there is otherwise nothing that ever
+        drops the entry, so its (now unreachable) URL keeps getting scraped and
+        routed to. Periodically list the real pods and drop any local engine
+        that is gone or no longer ready.
+
+        Prune-only: adding live engines stays the watch's job (it queries the
+        engine for its models), so this stays cheap (no per-pod HTTP) and cannot
+        flap against the watch -- it only removes on conditions the watch itself
+        would act on (pod gone -> DELETED, not ready -> MODIFIED).
+        """
+        try:
+            # resource_version="0" is served from the watch cache (no etcd
+            # quorum read); slightly stale is fine for pruning.
+            pods = self.k8s_api.list_namespaced_pod(
+                namespace=self.namespace,
+                label_selector=self.label_selector,
+                resource_version="0",
+            )
+        except Exception as e:
+            logger.error(f"Service discovery reconcile failed to list pods: {e}")
+            return
+
+        ready_pods = {
+            pod.metadata.name
+            for pod in pods.items
+            if self._check_pod_ready(pod.status.container_statuses)
+        }
+        # Grace window: a just-added engine may be absent from the (possibly
+        # stale rv=0) cache while the watch already added it from a fresher
+        # event; the readiness transition is gone so the watch will not re-add.
+        # Only prune engines that have been known longer than one interval, so a
+        # genuine ghost is still removed within ~2 intervals.
+        cutoff = time.time() - self.reconcile_interval
+        with self.available_engines_lock:
+            stale = [
+                name
+                for name, info in self.available_engines.items()
+                if name not in ready_pods and info.added_timestamp < cutoff
+            ]
+            for name in stale:
+                logger.warning(
+                    f"Reconcile: dropping stale engine {name} "
+                    f"({self.available_engines[name].url}); pod is gone or not "
+                    f"ready but no DELETED event was received"
+                )
+                del self.available_engines[name]
+
     def get_endpoint_info(self) -> List[EndpointInfo]:
         """
         Get the URLs of the serving engines that are available for
@@ -690,8 +766,11 @@ class K8sServiceDiscovery(ServiceDiscovery):
         Close the service discovery module.
         """
         self.running = False
+        self._stop_event.set()
         self.k8s_watcher.stop()
         self.watcher_thread.join()
+        if self.reconcile_thread is not None:
+            self.reconcile_thread.join()
 
 
 def _create_service_discovery(

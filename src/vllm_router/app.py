@@ -186,6 +186,7 @@ def initialize_all(app: FastAPI, args):
             label_selector=args.k8s_label_selector,
             prefill_model_labels=args.prefill_model_labels,
             decode_model_labels=args.decode_model_labels,
+            reconcile_interval=args.k8s_reconcile_interval,
         )
 
     else:

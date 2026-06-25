@@ -189,6 +189,13 @@ def parse_args():
         help="The label selector to filter vLLM pods when using K8s service discovery.",
     )
     parser.add_argument(
+        "--k8s-reconcile-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between stale-engine prunes in K8s service discovery; "
+        "guards against ghost engines left by missed watch events. <= 0 disables.",
+    )
+    parser.add_argument(
         "--routing-logic",
         type=str,
         choices=[
