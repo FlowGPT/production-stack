@@ -50,6 +50,17 @@ except ImportError:
 logger = init_logger(__name__)
 
 
+def _wire_safe_headers(headers) -> dict:
+    """Re-encode forwarded header values to their original wire bytes.
+
+    uvicorn/ASGI decodes request headers with latin-1, so a value may hold code
+    points >127 (e.g. a session id derived from non-ASCII text). httpx encodes
+    str header values as ASCII and raises UnicodeEncodeError on those; latin-1
+    round-trips the exact client bytes and httpx forwards bytes verbatim.
+    """
+    return {key: value.encode("latin-1") for key, value in headers.items()}
+
+
 # TODO: (Brian) check if request is json beforehand
 async def process_request(
     request: Request,
@@ -101,7 +112,7 @@ async def process_request(
         async with request.app.state.httpx_client_wrapper().stream(
             method=request.method,
             url=backend_url + endpoint,
-            headers=dict(request.headers),
+            headers=_wire_safe_headers(request.headers),
             content=body,
             timeout=None,
         ) as backend_response:
