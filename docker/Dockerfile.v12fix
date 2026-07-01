@@ -1,4 +1,4 @@
-# Patch the reconcile/stale-engine fix and the non-ASCII header-forwarding fix
+# Patch the reconcile/stale-engine fix AND the non-ASCII header-forwarding fix
 # onto the released v1.2 router image. Only the changed files are overlaid onto
 # the installed package; nothing else in v1.2 is altered. Build context = repo root.
 FROM ssadds/production-stack-router:v1.2

@@ -1,0 +1,23 @@
+# v1.3 router image: overlays all changed-since-v1.2 router files onto the
+# released v1.2 image. Pure-Python overlay (no rebuild), same approach as
+# Dockerfile.v12fix. Build context = repo root.
+#
+# Contents layered on top of v1.2:
+#   - service_discovery.py        (v1.3.1: K8s stale-engine reconcile)
+#   - services/request_service/request.py (v1.3.2: non-ASCII header forwarding)
+#   - routing_logic.py + metrics  (v1.3: load_balanced_affinity P2C router)
+#   - parser.py, app.py           (wiring for the above)
+FROM ssadds/production-stack-router:v1.2
+
+ARG PKG=/usr/local/lib/python3.12/site-packages/vllm_router
+
+# Carry-forward fixes already shipped as v12fix.
+COPY src/vllm_router/service_discovery.py ${PKG}/service_discovery.py
+COPY src/vllm_router/services/request_service/request.py ${PKG}/services/request_service/request.py
+
+# New v1.3 load_balanced_affinity routing + its metrics and wiring.
+COPY src/vllm_router/routers/routing_logic.py ${PKG}/routers/routing_logic.py
+COPY src/vllm_router/routers/metrics_router.py ${PKG}/routers/metrics_router.py
+COPY src/vllm_router/services/metrics_service/__init__.py ${PKG}/services/metrics_service/__init__.py
+COPY src/vllm_router/parsers/parser.py ${PKG}/parsers/parser.py
+COPY src/vllm_router/app.py ${PKG}/app.py
