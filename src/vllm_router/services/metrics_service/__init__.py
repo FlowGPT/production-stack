@@ -52,6 +52,25 @@ num_decoding_requests = Gauge(
 healthy_pods_total = Gauge(
     "vllm:healthy_pods_total", "Number of healthy vLLM pods", ["server"]
 )
+
+# --- Router capacity / scale-out signals ------------------------------------
+# The router is a single asyncio event loop per worker; these say when a worker
+# (not the engines) is the bottleneck and more router replicas are needed.
+# livemax: report the worst worker's lag; livesum: total concurrency over workers.
+router_event_loop_lag_seconds = Gauge(
+    "router_event_loop_lag_seconds",
+    "Router asyncio event-loop scheduling lag, windowed max (seconds). High "
+    "values mean the worker's loop cannot keep up (CPU / sync blocking / too "
+    "many concurrent requests) and /health starts queueing -> add router "
+    "replicas. Leading indicator that captures all saturation causes in one "
+    "number.",
+    multiprocess_mode="livemax",
+)
+router_active_requests = Gauge(
+    "router_active_requests",
+    "Requests currently being proxied by the router (summed across workers).",
+    multiprocess_mode="livesum",
+)
 avg_latency = Gauge(
     "vllm:avg_latency", "Average end-to-end request latency", ["server"]
 )
@@ -168,5 +187,40 @@ cache_aware_returning_fallback_rate = Gauge(
 cache_aware_returning_session_store_errors_total = Counter(
     "vllm:cache_aware_returning_session_store_errors_total",
     "Returning-session store backend errors (fail-open; routing unaffected)",
+    ["operation"],
+)
+
+# --- load_balanced_affinity routing ---
+# hit + shed + placement partition every request: a returning session is either
+# kept on its remembered engine (hit) or moved to a lighter one (shed); anything
+# else (first visit / no session id / affinity off) is a fresh P2C placement.
+load_balanced_inflight_requests = Gauge(
+    "vllm:load_balanced_inflight_requests",
+    "load_balanced_affinity: in-flight requests dispatched by this router",
+    ["server"],
+)
+load_balanced_affinity_hit_total = Counter(
+    "vllm:load_balanced_affinity_hit_total",
+    "load_balanced_affinity: returning sessions kept on their remembered engine",
+)
+load_balanced_affinity_shed_total = Counter(
+    "vllm:load_balanced_affinity_shed_total",
+    "load_balanced_affinity: returning sessions moved off a busier remembered "
+    "engine to a lighter one (affinity sacrificed for balance)",
+)
+load_balanced_placement_total = Counter(
+    "vllm:load_balanced_placement_total",
+    "load_balanced_affinity: requests placed by power-of-two-choices",
+)
+load_balanced_affinity_hit_rate = Gauge(
+    "vllm:load_balanced_affinity_hit_rate",
+    "load_balanced_affinity: windowed affinity-hit fraction, hit / (hit + shed)",
+)
+# Shared session->engine store backend errors (redis). Incremented on any
+# fail-open event; routing falls back to a fresh placement while this rises.
+load_balanced_affinity_store_errors_total = Counter(
+    "vllm:load_balanced_affinity_store_errors_total",
+    "load_balanced_affinity: session->engine store backend errors (fail-open; "
+    "routing degrades to plain load balancing)",
     ["operation"],
 )

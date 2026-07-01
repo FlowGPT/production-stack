@@ -46,19 +46,16 @@ from vllm_router.stats.request_stats import get_request_stats_monitor
 metrics_router = APIRouter()
 
 
-def _get_cache_aware_router():
-    """Return the active CacheAwareLoadBalancingRouter, or None if not in use."""
+def _get_window_metrics_router():
+    """Active router if it has a ``refresh_window_metrics`` hook, else None."""
     # Imported lazily to avoid a circular import at module load.
-    from vllm_router.routers.routing_logic import (
-        CacheAwareLoadBalancingRouter,
-        get_routing_logic,
-    )
+    from vllm_router.routers.routing_logic import get_routing_logic
 
     try:
         router = get_routing_logic()
     except ValueError:
         return None
-    return router if isinstance(router, CacheAwareLoadBalancingRouter) else None
+    return router if hasattr(router, "refresh_window_metrics") else None
 
 
 # Define Gauges for system resource usage
@@ -135,9 +132,9 @@ async def metrics():
             engine_stat.gpu_prefix_cache_queries_total
         )
 
-    # Refresh cache-aware window rates so they decay to zero when traffic stops
-    # (they are otherwise only recomputed on a routing decision).
-    refresh = getattr(_get_cache_aware_router(), "refresh_window_metrics", None)
+    # Refresh the active router's window rates so they decay to zero when
+    # traffic stops (they are otherwise only recomputed on a routing decision).
+    refresh = getattr(_get_window_metrics_router(), "refresh_window_metrics", None)
     if callable(refresh):
         refresh()
 

@@ -30,6 +30,7 @@ from vllm_router.routers.routing_logic import (
     PrefixAwareRouter,
 )
 from vllm_router.service_discovery import get_service_discovery
+from vllm_router.services.metrics_service import router_active_requests
 from vllm_router.services.request_service.rewriter import (
     get_request_rewriter,
     is_request_rewriter_initialized,
@@ -108,6 +109,9 @@ async def process_request(
     # For non-streaming requests, collect the full response to cache it properly
     full_response = bytearray()
 
+    # Count this request as in-flight at the router for the whole proxy lifetime
+    # (including streaming), a scale-out signal; released in the finally below.
+    router_active_requests.inc()
     try:
         async with request.app.state.httpx_client_wrapper().stream(
             method=request.method,
@@ -135,6 +139,7 @@ async def process_request(
             backend_url, request_id, time.time()
         )
     finally:
+        router_active_requests.dec()
         # Always release the router's in-flight slot, even if the backend stream
         # errored or the client disconnected mid-stream; otherwise the count
         # leaks until the safety TTL and skews fallback ranking (no-op router
