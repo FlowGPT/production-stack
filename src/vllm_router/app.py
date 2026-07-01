@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import asyncio
 import json
 import logging
 import os
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 
 import sentry_sdk
@@ -84,6 +86,30 @@ except ImportError:
 logger = logging.getLogger("uvicorn")
 
 
+async def _event_loop_lag_monitor(interval: float = 0.5, window: float = 10.0):
+    """Publish the worker's asyncio event-loop scheduling lag (see the
+    router_event_loop_lag_seconds metric for what it signals).
+
+    Sleeps ``interval`` and measures how much longer than that the loop actually
+    took to resume; the excess is scheduling lag. Reports a rolling ``window``
+    max so a brief stall is still visible to an infrequent scrape.
+    """
+    from vllm_router.services.metrics_service import router_event_loop_lag_seconds
+
+    loop = asyncio.get_running_loop()
+    samples: "deque[tuple[float, float]]" = deque()
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(interval)
+        lag = max(0.0, (loop.time() - t0) - interval)
+        now = loop.time()
+        samples.append((now, lag))
+        cutoff = now - window
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+        router_event_loop_lag_seconds.set(max(s for _, s in samples))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Multi-worker mode: uvicorn spawns worker processes that import this module
@@ -109,7 +135,9 @@ async def lifespan(app: FastAPI):
     app.state.httpx_client_wrapper.start()
     if hasattr(app.state, "batch_processor"):
         await app.state.batch_processor.initialize()
+    lag_monitor_task = asyncio.create_task(_event_loop_lag_monitor())
     yield
+    lag_monitor_task.cancel()
     await app.state.httpx_client_wrapper.stop()
 
     # Close the threaded-components
@@ -136,6 +164,8 @@ async def lifespan(app: FastAPI):
     if router is not None:
         logger.info("Closing returning-session store")
         router.close_returning_session_store()
+        logger.info("Closing affinity store")
+        router.close_affinity_store()
 
 
 def initialize_all(app: FastAPI, args):
@@ -239,6 +269,19 @@ def initialize_all(app: FastAPI, args):
         returning_session_local_cache_size=(
             args.cache_aware_returning_session_local_cache_size
         ),
+        lb_d_choices=args.lb_d_choices,
+        lb_affinity=args.lb_affinity,
+        lb_affinity_slack=args.lb_affinity_slack,
+        lb_affinity_ttl=args.lb_affinity_ttl,
+        lb_affinity_max_size=args.lb_affinity_max_size,
+        lb_inflight_decay=args.lb_inflight_decay,
+        lb_stats_window=args.lb_stats_window,
+        lb_affinity_store_type=args.lb_affinity_store,
+        lb_affinity_redis_url=args.lb_affinity_redis_url,
+        lb_affinity_redis_key_prefix=args.lb_affinity_redis_key_prefix,
+        lb_affinity_redis_timeout=args.lb_affinity_redis_timeout,
+        lb_affinity_redis_refresh_fraction=args.lb_affinity_redis_refresh_fraction,
+        lb_affinity_redis_required=args.lb_affinity_redis_required,
         lmcache_controller_port=args.lmcache_controller_port,
         prefill_model_labels=args.prefill_model_labels,
         decode_model_labels=args.decode_model_labels,

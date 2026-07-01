@@ -20,7 +20,7 @@ import math
 import random
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from typing import Deque, Dict, List, Optional, Tuple
 
 from fastapi import Request
@@ -41,6 +41,11 @@ except ImportError:
 from uhashring import HashRing
 
 from vllm_router.log import init_logger
+from vllm_router.routers.affinity_store import (
+    AffinityStore,
+    MemoryAffinityStore,
+    create_affinity_store,
+)
 from vllm_router.routers.returning_session_store import (
     ReturningSessionStore,
     create_returning_session_store,
@@ -64,6 +69,11 @@ from vllm_router.services.metrics_service import (
     cache_aware_returning_sticky_total,
     cache_aware_stickiness_rate,
     cache_aware_sticky_total,
+    load_balanced_affinity_hit_rate,
+    load_balanced_affinity_hit_total,
+    load_balanced_affinity_shed_total,
+    load_balanced_inflight_requests,
+    load_balanced_placement_total,
 )
 from vllm_router.stats.engine_stats import EngineStats
 from vllm_router.stats.request_stats import RequestStats, get_request_stats_monitor
@@ -76,6 +86,7 @@ class RoutingLogic(str, enum.Enum):
     ROUND_ROBIN = "roundrobin"
     SESSION_BASED = "session"
     CACHE_AWARE_LOAD_BALANCING = "cache_aware_load_balancing"
+    LOAD_BALANCED_AFFINITY = "load_balanced_affinity"
     KVAWARE = "kvaware"
     PREFIXAWARE = "prefixaware"
     DISAGGREGATED_PREFILL = "disaggregated_prefill"
@@ -163,6 +174,14 @@ class RoutingInterface(metaclass=SingletonABCMeta):
         Release any returning-session store backend (e.g. Redis connections).
         Default is a no-op so app shutdown can call it on any router
         unconditionally; only the cache-aware router owns such a store.
+        """
+        return None
+
+    def close_affinity_store(self) -> None:
+        """
+        Release any session->engine affinity store backend (e.g. Redis
+        connections). Default is a no-op so app shutdown can call it on any
+        router unconditionally; only the load_balanced_affinity router owns one.
         """
         return None
 
@@ -725,6 +744,215 @@ class CacheAwareLoadBalancingRouter(RoutingInterface):
             cache_aware_returning_fallback_rate.set(0)
 
 
+class LoadBalancedAffinityRouter(RoutingInterface):
+    """
+    Power-of-two-choices load balancing with optional, self-shedding affinity.
+
+    Placement samples ``d_choices`` engines at random and picks the lower
+    effective load (running + queue + this router's in-flight). P2C is chosen
+    over the alternatives for two reasons that drive tail latency:
+    consistent hashing places one-shot sessions at random (Poisson load spread,
+    worse than round-robin), while round-robin is load-oblivious (cannot avoid a
+    momentary hotspot); P2C is load-aware yet needs no cross-replica
+    coordination, so it does not herd the way a global least-loaded pick does
+    when replicas share a stale scrape.
+
+    There are deliberately NO binary overload thresholds: a busier engine just
+    gets proportionally fewer requests. A hard latency/queue gate instead flips
+    ALL traffic off an engine at once (one window timeout poisons p99 -> shed
+    everything -> the herd overloads the next engine -> oscillation).
+
+    Optional affinity (needs ``session_key``): a session is remembered on the
+    engine it was placed on and routed back there only while that engine is
+    within ``affinity_slack`` of a fresh P2C pick, otherwise shed to the lighter
+    engine and re-remembered. So affinity never costs balance; a workload with
+    little reuse degrades to pure P2C (no worse than round-robin). The
+    session->engine map lives in a pluggable ``AffinityStore`` (see
+    ``affinity_store`` for the memory-vs-redis backend tradeoffs).
+
+    Concurrency: local mutable state (in-flight map, hit-rate window) is mutated
+    only from the asyncio event-loop thread (route_request / release_inflight
+    both run there), so no lock is used. The redis affinity store is itself
+    connection-pool thread-safe.
+    """
+
+    # Finite (not 0) so an unreachable ghost engine reporting no stats is never
+    # the top placement pick, yet at cold start all-unknown engines stay equal
+    # and P2C still spreads randomly.
+    _NO_STATS_PENALTY = 1e6
+
+    def __init__(
+        self,
+        session_key: Optional[str] = None,
+        d_choices: int = 2,
+        affinity: bool = True,
+        affinity_slack: float = 0.0,
+        affinity_ttl: float = 3600.0,
+        affinity_max_size: int = 0,
+        inflight_decay: float = 300.0,
+        stats_window: float = 30.0,
+        affinity_store: Optional[AffinityStore] = None,
+    ):
+        if hasattr(self, "_initialized"):
+            return
+        self.session_key = session_key
+        # Sample size for power-of-two-choices; >=2 (1 would be load-oblivious).
+        self.d_choices = max(2, d_choices)
+        # Affinity needs a session id to key on; without one we are pure P2C.
+        self.affinity_enabled = bool(affinity and session_key is not None)
+        self.affinity_slack = affinity_slack
+        self.affinity_ttl = affinity_ttl
+        self.inflight_decay = inflight_decay
+        self.stats_window = stats_window
+        # session->engine store; defaults to per-worker memory when no shared
+        # (redis) backend is injected. Backend semantics live in affinity_store.
+        self._store: AffinityStore = (
+            affinity_store
+            if affinity_store is not None
+            else MemoryAffinityStore(max_size=affinity_max_size)
+        )
+        # Per-engine in-flight: dispatched-but-not-yet-finished requests, giving
+        # immediate self-feedback between the (stale) periodic scrapes so P2C
+        # picks made within one replica also see each other.
+        self._inflight: Dict[str, Deque[float]] = {}
+        # Sliding window of returning-session affinity outcomes (hit / shed) so
+        # the hit-rate gauge decays to 0 when traffic stops.
+        self._aff_events: Deque[Tuple[float, bool]] = deque()
+        self._aff_hit = 0
+        self._initialized = True
+
+    def _record_dispatch(self, now: float, url: str) -> None:
+        self._inflight.setdefault(url, deque()).append(now)
+
+    def release_inflight(self, engine_url: str) -> None:
+        """Notify that one request to ``engine_url`` finished (decrement in-flight)."""
+        dq = self._inflight.get(engine_url)
+        if dq:
+            dq.popleft()
+
+    def _pending_load(self, url: str, now: float) -> int:
+        """In-flight count for ``url``; lazily drops entries past the safety cap."""
+        dq = self._inflight.get(url)
+        if not dq:
+            return 0
+        cutoff = now - self.inflight_decay
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        return len(dq)
+
+    def _effective_load(
+        self, url: str, engine_stats: Dict[str, EngineStats], now: float
+    ) -> float:
+        """running + queue + in-flight; unknown engines get the ghost penalty."""
+        inflight = self._pending_load(url, now)
+        stats = engine_stats.get(url)
+        if stats is None:
+            return self._NO_STATS_PENALTY + inflight
+        return stats.num_running_requests + stats.num_queuing_requests + inflight
+
+    def _p2c(
+        self, urls: List[str], engine_stats: Dict[str, EngineStats], now: float
+    ) -> str:
+        """Power-of-two-choices: lowest load of d random engines, ties random."""
+        n = len(urls)
+        if n == 1:
+            return urls[0]
+        sample = random.sample(urls, min(self.d_choices, n))
+        loads = [(self._effective_load(u, engine_stats, now), u) for u in sample]
+        min_load = min(load for load, _ in loads)
+        best = [u for load, u in loads if load <= min_load + 1e-9]
+        return random.choice(best) if len(best) > 1 else best[0]
+
+    def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+    ) -> str:
+        now = time.time()
+        urls = [e.url for e in endpoints]
+        session_id = request.headers.get(self.session_key) if self.session_key else None
+        chosen = self._choose(urls, session_id, engine_stats, now)
+        self._record_dispatch(now, chosen)
+        return chosen
+
+    def _choose(
+        self,
+        urls: List[str],
+        session_id: Optional[str],
+        engine_stats: Dict[str, EngineStats],
+        now: float,
+    ) -> str:
+        if not (self.affinity_enabled and session_id is not None):
+            load_balanced_placement_total.inc()
+            return self._p2c(urls, engine_stats, now)
+
+        ttl = self.affinity_ttl
+        remembered = self._store.get(session_id, now, ttl)
+        if remembered is None or remembered not in set(urls):
+            # First visit (or remembered engine gone): place by load, remember.
+            chosen = self._p2c(urls, engine_stats, now)
+            load_balanced_placement_total.inc()
+            self._store.put(session_id, chosen, now, ttl)
+            return chosen
+
+        # Returning: keep the remembered engine only while it is not materially
+        # busier than a fresh P2C pick, so affinity never costs us balance.
+        pick = self._p2c(urls, engine_stats, now)
+        rem_load = self._effective_load(remembered, engine_stats, now)
+        pick_load = self._effective_load(pick, engine_stats, now)
+        if rem_load <= pick_load + self.affinity_slack:
+            self._record_affinity(now, True)
+            self._store.put(session_id, remembered, now, ttl)
+            return remembered
+        self._record_affinity(now, False)
+        # Shed: route to the lighter engine and remember it as the new home.
+        self._store.put(session_id, pick, now, ttl)
+        return pick
+
+    def _evict_aff(self, now: float) -> None:
+        cutoff = now - self.stats_window
+        while self._aff_events and self._aff_events[0][0] < cutoff:
+            _, was_hit = self._aff_events.popleft()
+            if was_hit:
+                self._aff_hit -= 1
+
+    def _record_affinity(self, now: float, is_hit: bool) -> None:
+        self._aff_events.append((now, is_hit))
+        if is_hit:
+            self._aff_hit += 1
+            load_balanced_affinity_hit_total.inc()
+        else:
+            load_balanced_affinity_shed_total.inc()
+        self._evict_aff(now)
+        self._publish_affinity_rate()
+
+    def _publish_affinity_rate(self) -> None:
+        total = len(self._aff_events)
+        load_balanced_affinity_hit_rate.set(self._aff_hit / total if total else 0)
+
+    def refresh_window_metrics(self, now: float = None) -> None:
+        """Decay the windowed affinity-hit rate and publish per-engine in-flight.
+
+        Called on /metrics scrape so rates fall to zero when traffic stops
+        rather than freezing at the last recorded value.
+        """
+        now = time.time() if now is None else now
+        self._evict_aff(now)
+        self._publish_affinity_rate()
+        for url in list(self._inflight.keys()):
+            load_balanced_inflight_requests.labels(server=url).set(
+                self._pending_load(url, now)
+            )
+
+    def close_affinity_store(self) -> None:
+        """Release the affinity store backend (e.g. Redis connections)."""
+        store = getattr(self, "_store", None)
+        if store is not None:
+            store.close()
+
+
 class KvawareRouter(RoutingInterface):
     """
     Route the request to the appropriate engine URL by where the KV cache
@@ -1014,6 +1242,47 @@ def initialize_routing_logic(
         return CacheAwareLoadBalancingRouter(
             session_key=kwargs.get("session_key"), **router_kwargs
         )
+    elif routing_logic == RoutingLogic.LOAD_BALANCED_AFFINITY:
+        logger.info(
+            f"Initializing load-balanced affinity routing logic with kwargs: {kwargs}"
+        )
+        # Map the namespaced lb_* kwargs (distinct from cache_aware's keys, which
+        # share the same call) onto the router's parameter names. Pass only those
+        # supplied so defaults live solely in the __init__ signature.
+        lb_to_param = {
+            "lb_d_choices": "d_choices",
+            "lb_affinity": "affinity",
+            "lb_affinity_slack": "affinity_slack",
+            "lb_affinity_ttl": "affinity_ttl",
+            "lb_affinity_max_size": "affinity_max_size",
+            "lb_inflight_decay": "inflight_decay",
+            "lb_stats_window": "stats_window",
+        }
+        router_kwargs = {
+            param: kwargs[key] for key, param in lb_to_param.items() if key in kwargs
+        }
+        # Build the session->engine store from the *_store kwargs so the router
+        # stays agnostic of the backend. Only when affinity is actually on (it
+        # needs a session key) -- otherwise the redis backend would demand a URL
+        # for a map that is never consulted.
+        affinity_on = kwargs.get("lb_affinity", True) and kwargs.get("session_key")
+        if "affinity_store" not in router_kwargs and affinity_on:
+            router_kwargs["affinity_store"] = create_affinity_store(
+                kwargs.get("lb_affinity_store_type", "memory"),
+                redis_url=kwargs.get("lb_affinity_redis_url"),
+                redis_key_prefix=kwargs.get(
+                    "lb_affinity_redis_key_prefix", "vllm:lb-affinity:"
+                ),
+                redis_timeout=kwargs.get("lb_affinity_redis_timeout", 0.05),
+                redis_refresh_fraction=kwargs.get(
+                    "lb_affinity_redis_refresh_fraction", 0.5
+                ),
+                redis_required=kwargs.get("lb_affinity_redis_required", False),
+                max_size=kwargs.get("lb_affinity_max_size", 0),
+            )
+        return LoadBalancedAffinityRouter(
+            session_key=kwargs.get("session_key"), **router_kwargs
+        )
     elif routing_logic == RoutingLogic.KVAWARE:
         logger.info("Initializing kvaware routing logic")
         router = KvawareRouter(
@@ -1043,6 +1312,7 @@ def reconfigure_routing_logic(
         SessionRouter,
         RoundRobinRouter,
         CacheAwareLoadBalancingRouter,
+        LoadBalancedAffinityRouter,
         KvawareRouter,
         DisaggregatedPrefillRouter,
     ):
@@ -1057,6 +1327,7 @@ def get_routing_logic() -> RoutingInterface:
         SessionRouter,
         RoundRobinRouter,
         CacheAwareLoadBalancingRouter,
+        LoadBalancedAffinityRouter,
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,

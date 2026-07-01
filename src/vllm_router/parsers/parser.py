@@ -99,6 +99,25 @@ def validate_args(args):
             "--cache-aware-returning-session-redis-url must be provided when "
             "--cache-aware-returning-session-store=redis."
         )
+    if (
+        args.routing_logic == "load_balanced_affinity"
+        and args.lb_affinity
+        and args.session_key is None
+    ):
+        raise ValueError(
+            "load_balanced_affinity with affinity needs --session-key; pass it "
+            "or use --no-lb-affinity for pure load balancing."
+        )
+    if (
+        args.routing_logic == "load_balanced_affinity"
+        and args.lb_affinity
+        and args.lb_affinity_store == "redis"
+        and not args.lb_affinity_redis_url
+    ):
+        raise ValueError(
+            "--lb-affinity-redis-url must be provided when "
+            "--lb-affinity-store=redis."
+        )
     if args.log_stats and args.log_stats_interval <= 0:
         raise ValueError("Log stats interval must be greater than 0.")
     if args.engine_stats_interval <= 0:
@@ -202,11 +221,121 @@ def parse_args():
             "roundrobin",
             "session",
             "cache_aware_load_balancing",
+            "load_balanced_affinity",
             "kvaware",
             "prefixaware",
             "disaggregated_prefill",
         ],
         help="The routing logic to use",
+    )
+    parser.add_argument(
+        "--lb-d-choices",
+        type=int,
+        default=2,
+        help="load_balanced_affinity: number of engines sampled for "
+        "power-of-two-choices placement (pick the lighter). 2 is the classic "
+        "sweet spot; higher tightens balance with diminishing returns. Min 2.",
+    )
+    parser.add_argument(
+        "--lb-affinity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="load_balanced_affinity: remember a session's engine and route it "
+        "back there while not materially busier than a fresh P2C pick. "
+        "--no-lb-affinity gives pure load balancing. Needs --session-key. "
+        "The default memory store is per-worker (multiple workers/replicas "
+        "dilute affinity); use --lb-affinity-store=redis to share it across "
+        "workers and replicas. Default on.",
+    )
+    parser.add_argument(
+        "--lb-affinity-slack",
+        type=float,
+        default=0.0,
+        help="load_balanced_affinity: keep a returning session on its "
+        "remembered engine while that engine's load is within this many "
+        "requests of a fresh P2C pick. Higher = stickier (more cache reuse, "
+        "looser balance); 0 = shed as soon as the remembered engine is busier. "
+        "Default 0.",
+    )
+    parser.add_argument(
+        "--lb-affinity-ttl",
+        type=float,
+        default=3600.0,
+        help="load_balanced_affinity: seconds to remember a session->engine "
+        "mapping. After this a returning session is treated as a first visit "
+        "(re-placed by load). Default 3600.",
+    )
+    parser.add_argument(
+        "--lb-affinity-max-size",
+        type=int,
+        default=0,
+        help="load_balanced_affinity: LRU cap on the in-memory session->engine "
+        "map. 0 = unbounded (TTL eviction only). Default 0.",
+    )
+    parser.add_argument(
+        "--lb-inflight-decay",
+        type=float,
+        default=300.0,
+        help="load_balanced_affinity: safety cap (seconds) for in-flight "
+        "accounting; drops dispatches whose completion was never observed (e.g. "
+        "client disconnect) so they do not leak. Default 300.",
+    )
+    parser.add_argument(
+        "--lb-stats-window",
+        type=float,
+        default=30.0,
+        help="load_balanced_affinity: sliding window (seconds) for the "
+        "affinity-hit-rate metric. Default 30.",
+    )
+    parser.add_argument(
+        "--lb-affinity-store",
+        type=str,
+        default="memory",
+        choices=["memory", "redis"],
+        help="load_balanced_affinity: backend for the session->engine map. "
+        "'memory' is per-worker (multiple workers/replicas dilute affinity); "
+        "'redis' shares it so any worker routes a returning session to the same "
+        "engine. Default 'memory'.",
+    )
+    parser.add_argument(
+        "--lb-affinity-redis-url",
+        type=str,
+        default=None,
+        help="load_balanced_affinity: redis URL (e.g. redis://host:6379/0) for "
+        "the shared session->engine map. Required when --lb-affinity-store=redis.",
+    )
+    parser.add_argument(
+        "--lb-affinity-redis-key-prefix",
+        type=str,
+        default="vllm:lb-affinity:",
+        help="load_balanced_affinity: key prefix for session->engine entries in "
+        "Redis. Default 'vllm:lb-affinity:'.",
+    )
+    parser.add_argument(
+        "--lb-affinity-redis-timeout",
+        type=float,
+        default=0.05,
+        help="load_balanced_affinity: per-call socket timeout (seconds) for the "
+        "redis session->engine lookups. On timeout the call fails open (routing "
+        "degrades to plain load balancing). Default 0.05.",
+    )
+    parser.add_argument(
+        "--lb-affinity-redis-refresh-fraction",
+        type=float,
+        default=0.5,
+        help="load_balanced_affinity: skip the redis TTL-refresh SET on a hit "
+        "(unchanged engine) while the last write is younger than this fraction "
+        "of the TTL, cutting the hot path to one GET. A changed engine (shed / "
+        "re-placement) always writes through. 0 disables (write every time). "
+        "Default 0.5.",
+    )
+    parser.add_argument(
+        "--lb-affinity-redis-required",
+        action="store_true",
+        help="load_balanced_affinity: hard-fail (crash-loop) at startup if the "
+        "redis store is unreachable. Off by default: redis is not a hard startup "
+        "dependency -- if it is down the router starts fail-open (plain load "
+        "balancing) and picks up redis automatically once it is reachable.",
     )
     parser.add_argument(
         "--cache-aware-tolerate-waiting-requests",
