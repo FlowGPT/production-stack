@@ -1,48 +1,54 @@
-# v1.3 更新日志 — Cache-aware 引擎间 QPS 均衡（哈希虚拟节点可调）
+# v1.3 更新日志 — load_balanced_affinity 路由
 
-> 在 v1.2 基础上，新增一致性哈希**虚拟节点数（vnodes）可配**，用于收紧引擎间 QPS 离散度。默认行为对缓存亲和性零影响。
+新增路由模式 load_balanced_affinity：Power-of-Two-Choices 负载放置 + 自卸式会话亲和，**同时**拿到"轮询的 QPS 均衡与短长尾"和"哈希的前缀缓存亲和"，且**没有任何二值过载阈值**（避免"窗口一超时全体 fallback"的级联震荡）。
 
-## 背景：为什么引擎间 QPS 会差出 ±15%
+注：设计动机、仿真证明、参数详解见 router-load-balanced-affinity-changelog.md；离线复现 scripts/routing_sim.py。多副本 / redis / 容量 / 故障相关能力在 **v1.3.1**（见 router-v1.3.1-changelog.md）。
 
-cache-aware 路由用一致性哈希把 session 粘到引擎，**均衡的是「会话 key 的数量」，不是 QPS**。而且之前用的是裸 `HashRing()`，即 uhashring 默认 **160** 个虚拟节点/引擎——节点偏少，环本身就不平滑。
+## 路由逻辑
 
-40 引擎、纯哈希分布（离线模拟，会话数足够多时的理论上限）：
+- **放置（P2C）**：随机采样 lb-d-choices（默认 2）个引擎，选 effective_load 最低者，平手随机。effective_load = 引擎上报 running + queuing + 本 router 进程 in-flight。busier 的引擎只是拿到按比例更少的请求，不是被一刀切开。
+- **自卸亲和（需 session-key）**：记住会话到引擎，回访时**仅当**记忆引擎不比一次新 P2C pick 忙超过 lb-affinity-slack（请求数）才贴回；否则 shed 到更轻引擎并改记。所以亲和**从不倒贴均衡**，低复用负载自动退化为纯 P2C（不差于轮询）。
+- **死引擎守卫**：抓不到 stats 的引擎给一个有限大惩罚（非 0），既不会因"看起来很闲"被当放置磁铁，冷启动全未知仍随机均分。
+- **in-flight**：本进程已派发未完成的请求计数，补足周期性 stats 抓取之间的即时负载反馈，让同副本内的并发 P2C 决策彼此可见。lb-inflight-decay 兜底清理未观测到完成的计数。
 
-| vnodes | CV | max/min |
-| --- | --- | --- |
-| 40 | 14.1% | 1.91 |
-| **160（旧默认）** | **6.5%** | **1.40** |
-| 500 | 5.2% | 1.29 |
-| **1000（新默认）** | **2.4%** | **1.11** |
-| 2000 | 3.0% | 1.12 |
+## 亲和存储
 
-旧默认 160 → max/min≈1.4，与线上观测的 “40 pod / 160 QPS，单 pod 3.4~4.4” 几乎吻合。
+本版为**进程内 memory**（TTL + LRU，lb-affinity-max-size）。多副本 / 多 worker 下按进程独立，同会话命中别的进程会被按负载重新放置（均衡不受影响，只少一次缓存命中）。跨副本一致亲和用 redis，见 v1.3.1。
 
-端到端实测（40 mock 引擎 + 真 router 进程，40000 个不同 session，唯一变量是 vnodes）：
+## 指标
 
-| vnodes | min | max | max/min | CV |
-| --- | --- | --- | --- | --- |
-| **160** | 822 | 1173 | **1.43** | 9.5% |
-| **1000** | 899 | 1091 | **1.21** | 4.6% |
+- vllm:load_balanced_placement_total / _affinity_hit_total / _affinity_shed_total —— 三者**分区全部请求**（首访 / 无 session / 亲和关 = placement；回访贴回 = hit；回访改投 = shed）。
+- vllm:load_balanced_affinity_hit_rate —— 窗口命中率 hit/(hit+shed)（gauge，多 worker 下 mostrecent，集群口径请用上面 counter 的 rate 重算）。
+- vllm:load_balanced_inflight_requests{server} —— 本 router 派发的在途请求。
 
-> 注意：真实场景的离散度落在「离线上限」和「E2E 实测」之间，**取决于活跃会话数**——会话越多越接近理论值（1000 vnodes 下 ~1.1），会话越少有限样本噪声越大（如 4 万会话下 ~1.2）。所以不要把 1000 vnodes 简单理解为「一定收到 1.1」，更稳妥的预期是 **~1.1–1.2**。
+## 参数
 
-## 新增
-- **`--cache-aware-hash-vnodes N`（默认 1000）**：每引擎在一致性哈希环上的虚拟节点数。调大 → 会话 key 分布更平滑 → 引擎间 QPS 离散度更小（实测 max/min 从 ~1.4 收到 ~1.1）。
-  - **不改变缓存亲和性**：同一 session 仍确定性映到同一引擎，只是整体分布更均匀。
-  - **稳态开销可忽略**：环只在引擎增删时重建；40×1000=4 万点，`get_node` 仍是 O(log n) 二分，内存仅几 MB。
-  - 只作用于 `cache_aware_load_balancing`；`SessionRouter` / `KvawareRouter` 不受影响。
+各参数含义：
 
-## 升级与配置
-直接换镜像即可，**默认就从 160 提升到 1000**，无需额外配置。如需进一步收紧可设 `--cache-aware-hash-vnodes 2000`（收益已趋平，一般 1000 足够）。
+- --routing-logic load_balanced_affinity —— 启用本模式
+- --session-key x-session-id —— 亲和键；不给则纯 P2C
+- --lb-d-choices 2 —— P2C 采样数
+- --lb-affinity / --no-lb-affinity —— 亲和开关，默认开
+- --lb-affinity-slack 0 —— 记忆引擎可比新抽样忙多少（请求数）仍贴回；越大越粘
+- --lb-affinity-ttl 3600 —— 会话到引擎映射保留秒数
+- --lb-affinity-max-size 0 —— 内存后端 LRU 上限，0 = 不限（仅 TTL 淘汰）
+- --lb-inflight-decay 300 —— in-flight 计数安全上限
+- --lb-stats-window 30 —— hit-rate 指标窗口
 
-## vnodes 治不了的两种残余不均
-vnodes 只磨平「会话**数**」的不均。以下两种需另行处理：
-1. **活跃会话太少**：若峰值并发 session 仅数百，单 pod 会话太少，单会话速率方差主导，加 vnodes 帮助有限。
-2. **会话权重不均**：个别 session 频率高/输出长。一致性哈希按 key 数均衡、不按「重量」均衡。
+示例（可直接粘贴）：
 
-→ 若调大 vnodes 后仍不均，下一步是 **Consistent Hashing with Bounded Loads（CHBL）**：给每引擎设 `(1+ε)×均值` 上限、超限沿环顺延，把不均强制压到 ε 内同时保留多数亲和。本版未实现，留作后续。
+```bash
+--routing-logic load_balanced_affinity \
+  --session-key x-session-id \
+  --lb-d-choices 2 \
+  --lb-affinity \
+  --lb-affinity-slack 0 \
+  --lb-affinity-ttl 3600 \
+  --lb-affinity-max-size 0 \
+  --lb-inflight-decay 300 \
+  --lb-stats-window 30
+```
 
-## 测试
-- `src/tests/test_cache_aware_router.py::test_hash_vnodes_default_and_tighter_distribution`：校验默认=1000，且 1000 vnodes 的 max/min 严格小于 160、且 < 1.25。
-- 全量单测 45 passed（CPU，无 GPU 占用）。
+## 升级
+
+把 --routing-logic 切到 load_balanced_affinity（加 --session-key 启用亲和）即可；不切则行为与 v1.2 一致。镜像随 v1.3.1 发布（含本路由 + 多副本生产化），见 router-v1.3.1-changelog.md。
