@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import time
-from collections import deque
+from collections import deque, Counter
 from dataclasses import dataclass
-from typing import Deque, Dict, Tuple
+from typing import Deque, Dict, Tuple, Optional
 
 from vllm_router.log import init_logger
 
@@ -53,6 +53,16 @@ class RequestStats:
     avg_itl: float
     # Number of swapped requests (moved from GPU to CPU)
     num_swapped_requests: int
+    # Dictionary counting different routing methods used
+    routing_methods: Dict[str, int] = None
+
+@dataclass
+class RoutingMethodEntry:
+    """
+    A class to record the routing method used for a request.
+    """
+    method: str
+    timestamp: float
 
 
 class MovingAverageMonitor:
@@ -138,11 +148,18 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
 
         # Counter for swapped requests
         self.swapped_requests: Dict[str, int] = {}
+        
+        # Counting different routing methods used by each engine
+        self.routing_methods: Dict[str, Counter] = {}
+        
+        # Counting different routing methods used in the current time window
+        self.routing_methods_window: Deque[RoutingMethodEntry] = deque()
 
         self.first_query_time: float = None
         self._initialized = True
 
-    def on_new_request(self, engine_url: str, request_id: str, timestamp: float):
+    def on_new_request(self, engine_url: str, request_id: str, 
+                    timestamp: float, routing_method: Optional[str] = None):
         """
         Tell the monitor that a new request has been created.
 
@@ -150,6 +167,7 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             engine_url: The URL of the serving engine
             request_id: The global request ID
             timestamp: the timestamp when the request was created
+            routing_method: The routing method used for this request
         """
         self.request_start_time[(engine_url, request_id)] = timestamp
 
@@ -167,9 +185,33 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             self.latency_monitors[engine_url] = MovingAverageMonitor(
                 self.sliding_window_size
             )
+            
+        # Counting different routing methods used by each engine
+        if routing_method:
+            if engine_url not in self.routing_methods:
+                self.routing_methods[engine_url] = Counter()
+            self.routing_methods[engine_url][routing_method] += 1
+            
+            # Counting different routing methods used in the current time window
+            self.routing_methods_window.append(
+                RoutingMethodEntry(method=routing_method, timestamp=timestamp)
+            )
+            
+            # Clean up expired routing methods records
+            self._clean_routing_methods_window(timestamp)
 
         if self.first_query_time is None:
             self.first_query_time = timestamp
+            
+    def _clean_routing_methods_window(self, current_time: float):
+        """
+        Clean up expired routing methods records
+        """
+        while (
+            self.routing_methods_window and 
+            self.routing_methods_window[0].timestamp < current_time - self.sliding_window_size
+        ):
+            self.routing_methods_window.popleft()
 
     def on_request_response(self, engine_url: str, request_id: str, timestamp: float):
         """
@@ -288,6 +330,9 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
                 swapped = self.swapped_requests[engine_url]
             else:
                 swapped = 0
+                
+            # Get routing methods statistics
+            routing_methods_dict = dict(self.routing_methods.get(engine_url, Counter()))
 
             ret[engine_url] = RequestStats(
                 qps=qps,
@@ -302,8 +347,43 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
                 avg_latency=avg_lat,
                 avg_itl=avg_itl_val,
                 num_swapped_requests=swapped,
+                routing_methods=routing_methods_dict,
             )
         return ret
+        
+    def get_all_routing_methods_in_window(self) -> Dict[str, int]:
+        """
+        Get the usage statistics of all routing methods in the current time window
+        
+        Returns:
+            Dict[str, int]: The routing method and its usage count in the current time window
+        """
+        # Clean up expired routing methods records
+        self._clean_routing_methods_window(time.time())
+        
+        # Counting different routing methods used in the current time window
+        methods_count = Counter()
+        for entry in self.routing_methods_window:
+            methods_count[entry.method] += 1
+        
+        return dict(methods_count)
+        
+    def get_routing_methods_qps(self) -> Dict[str, float]:
+        """
+        Get the QPS (Queries Per Second) of routing methods in the current time window
+        
+        Returns:
+            Dict[str, float]: The routing method and its QPS in the current time window
+        """
+        # Counting different routing methods used in the current time window
+        methods_count = self.get_all_routing_methods_in_window()
+        
+        # Calculating QPS = usage count / time window size
+        methods_qps = {}
+        for method, count in methods_count.items():
+            methods_qps[method] = count / self.sliding_window_size
+            
+        return methods_qps
 
 
 def initialize_request_stats_monitor(sliding_window_size: float):
